@@ -1,3 +1,5 @@
+.PHONY: fmt lint lint_install test
+
 fmt:
 	@golangci-lint fmt
 
@@ -13,3 +15,4 @@ lint_install:
 
 test:
 	go test ./...
+	go -C test test -v -count=1 -timeout 15m ./...
