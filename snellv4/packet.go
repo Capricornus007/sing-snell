@@ -3,12 +3,14 @@ package snellv4
 import (
 	"io"
 	"net"
+	"os"
 	"sync"
 
 	snell "github.com/sagernet/sing-snell"
 	"github.com/sagernet/sing-snell/internal/reuse"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -42,9 +44,6 @@ func (c *clientPacketConn) udpRequestAddrLen(destination M.Socksaddr) int {
 }
 
 func (c *clientPacketConn) writeRequest() error {
-	if c.writer != nil {
-		return nil
-	}
 	c.writeAccess.Lock()
 	defer c.writeAccess.Unlock()
 	if c.writer != nil {
@@ -118,6 +117,57 @@ func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksad
 	return c.writer.WritePacketBuffer(buffer)
 }
 
+func (c *clientPacketConn) CreatePacketBatchWriter() (N.PacketBatchWriter, bool) {
+	upstreamWriter, created := bufio.CreateVectorisedWriter(c.Conn)
+	if !created {
+		return nil, false
+	}
+	return &clientPacketBatchWriter{conn: c, upstream: upstreamWriter}, true
+}
+
+type clientPacketBatchWriter struct {
+	conn     *clientPacketConn
+	upstream N.VectorisedWriter
+
+	access sync.Mutex
+	writer N.VectorisedWriter
+}
+
+func (w *clientPacketBatchWriter) WritePacketBatch(buffers []*buf.Buffer, destinations []M.Socksaddr) error {
+	if len(buffers) == 0 || len(buffers) != len(destinations) {
+		buf.ReleaseMulti(buffers)
+		return os.ErrInvalid
+	}
+	w.access.Lock()
+	if w.writer == nil {
+		err := w.conn.writeRequest()
+		if err != nil {
+			w.access.Unlock()
+			buf.ReleaseMulti(buffers)
+			return err
+		}
+		_, err = w.conn.readReply()
+		if err != nil {
+			w.access.Unlock()
+			buf.ReleaseMulti(buffers)
+			return err
+		}
+		w.writer = w.conn.writer.CreatePacketVectorisedWriterFor(w.upstream)
+	}
+	recordWriter := w.writer
+	w.access.Unlock()
+	for index, buffer := range buffers {
+		header := buf.With(buffer.ExtendHeader(1 + w.conn.udpRequestAddrLen(destinations[index])))
+		common.Must(header.WriteByte(snell.UDPCommandForward))
+		err := snell.WriteUDPRequestAddress(header, destinations[index])
+		if err != nil {
+			buf.ReleaseMulti(buffers)
+			return err
+		}
+	}
+	return recordWriter.WriteVectorised(buffers)
+}
+
 func (c *clientPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 	recordReader, err := c.readReply()
 	if err != nil {
@@ -174,6 +224,8 @@ func (c *clientPacketConn) Upstream() any {
 }
 
 func (c *clientPacketConn) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	c.readWaitOptions = options
 	if c.reader != nil {
 		c.reader.InitializeReadWaiter(options)
@@ -212,7 +264,9 @@ func (c *clientPacketConn) WaitReadPacket() (*buf.Buffer, M.Socksaddr, error) {
 }
 
 var (
-	_ N.PacketConn       = (*clientPacketConn)(nil)
-	_ N.PacketReadWaiter = (*clientPacketConn)(nil)
-	_ N.WriterWithMTU    = (*clientPacketConn)(nil)
+	_ N.PacketConn              = (*clientPacketConn)(nil)
+	_ N.PacketReadWaiter        = (*clientPacketConn)(nil)
+	_ N.PacketBatchWriteCreator = (*clientPacketConn)(nil)
+	_ N.WriterWithMTU           = (*clientPacketConn)(nil)
+	_ N.PacketBatchWriter       = (*clientPacketBatchWriter)(nil)
 )

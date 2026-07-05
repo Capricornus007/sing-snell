@@ -11,6 +11,8 @@ import (
 
 	snell "github.com/sagernet/sing-snell"
 	"github.com/sagernet/sing-snell/snellv4"
+	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
@@ -156,6 +158,120 @@ func TestV4UDP(t *testing.T) {
 		n, _, readErr := packetConn.ReadFrom(received)
 		require.NoError(t, readErr)
 		require.True(t, bytes.Equal(message, received[:n]), "round %d", round)
+	}
+}
+
+func TestV4TCPVectorisedWriter(t *testing.T) {
+	port := freePort(t)
+	config := fmt.Sprintf("[snell-server]\nlisten = 0.0.0.0:%d\npsk = %s\nipv6 = false\n", port, testPSK)
+	startSnellServer(t, "v4", config, port)
+	echoPort := startTCPEcho(t)
+
+	client, err := snellv4.NewClient(snellv4.ClientOptions{PSK: []byte(testPSK)})
+	require.NoError(t, err)
+	serverConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	require.NoError(t, err)
+	defer serverConn.Close()
+
+	proxyConn := client.DialEarlyConn(serverConn, M.ParseSocksaddrHostPort("127.0.0.1", echoPort))
+	vectorisedWriter, created := bufio.CreateVectorisedWriter(proxyConn)
+	require.True(t, created)
+
+	partA := make([]byte, 700)
+	partB := make([]byte, 900)
+	_, err = rand.Read(partA)
+	require.NoError(t, err)
+	_, err = rand.Read(partB)
+	require.NoError(t, err)
+	expected := append(append([]byte(nil), partA...), partB...)
+
+	frontHeadroom := N.CalculateFrontHeadroom(proxyConn)
+	rearHeadroom := N.CalculateRearHeadroom(proxyConn)
+	buffers := make([]*buf.Buffer, 2)
+	for index, payload := range [][]byte{partA, partB} {
+		buffer := buf.NewSize(frontHeadroom + len(payload) + rearHeadroom)
+		buffer.Resize(frontHeadroom, 0)
+		_, err = buffer.Write(payload)
+		require.NoError(t, err)
+		buffers[index] = buffer
+	}
+	err = vectorisedWriter.WriteVectorised(buffers)
+	require.NoError(t, err)
+
+	received := make([]byte, len(expected))
+	require.NoError(t, proxyConn.SetReadDeadline(time.Now().Add(10*time.Second)))
+	_, err = io.ReadFull(proxyConn, received)
+	require.NoError(t, err)
+	require.Equal(t, expected, received)
+}
+
+func TestV4UDPPacketBatchWriter(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		version string
+	}{
+		{name: "official-v4", version: "v4"},
+		{name: "official-v5", version: "v5"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			port := freePort(t)
+			switch testCase.version {
+			case "v4":
+				config := fmt.Sprintf("[snell-server]\nlisten = 0.0.0.0:%d\npsk = %s\nipv6 = false\n", port, testPSK)
+				startSnellServer(t, "v4", config, port)
+			case "v5":
+				startSnellServer(t, "v5", v5Config(testPSK, port), port)
+			default:
+				t.Fatal("unknown server version")
+			}
+			echoPort := startUDPEcho(t)
+
+			client, err := snellv4.NewClient(snellv4.ClientOptions{PSK: []byte(testPSK)})
+			require.NoError(t, err)
+			serverConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+			require.NoError(t, err)
+			defer serverConn.Close()
+
+			packetConn, err := client.DialPacketConn(serverConn)
+			require.NoError(t, err)
+			batchWriter, created := bufio.CreatePacketBatchWriter(packetConn)
+			require.True(t, created)
+
+			target := M.ParseSocksaddrHostPort("127.0.0.1", echoPort)
+			frontHeadroom := N.CalculateFrontHeadroom(packetConn)
+			rearHeadroom := N.CalculateRearHeadroom(packetConn)
+			payloads := make([][]byte, 3)
+			buffers := make([]*buf.Buffer, len(payloads))
+			destinations := make([]M.Socksaddr, len(payloads))
+			for index := range payloads {
+				payload := make([]byte, 1200)
+				_, err = rand.Read(payload)
+				require.NoError(t, err)
+				payload[0] = byte(index)
+				payloads[index] = payload
+				buffer := buf.NewSize(frontHeadroom + len(payload) + rearHeadroom)
+				buffer.Resize(frontHeadroom, 0)
+				_, err = buffer.Write(payload)
+				require.NoError(t, err)
+				buffers[index] = buffer
+				destinations[index] = target
+			}
+			err = batchWriter.WritePacketBatch(buffers, destinations)
+			require.NoError(t, err)
+
+			received := make(map[string]int, len(payloads))
+			for range len(payloads) {
+				reply := make([]byte, 2048)
+				err = packetConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+				require.NoError(t, err)
+				n, _, readErr := packetConn.ReadFrom(reply)
+				require.NoError(t, readErr)
+				received[string(reply[:n])]++
+			}
+			for _, payload := range payloads {
+				require.Equal(t, 1, received[string(payload)])
+			}
+		})
 	}
 }
 

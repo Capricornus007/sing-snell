@@ -6,11 +6,13 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 
 	snell "github.com/sagernet/sing-snell"
 	"github.com/sagernet/sing-snell/internal/reuse"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -153,6 +155,55 @@ func (c *serverPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksad
 	return recordWriter.WritePacketBuffer(buffer)
 }
 
+func (c *serverPacketConn) CreatePacketBatchWriter() (N.PacketBatchWriter, bool) {
+	upstreamWriter, created := bufio.CreateVectorisedWriter(c.Conn)
+	if !created {
+		return nil, false
+	}
+	return &serverPacketBatchWriter{conn: c, upstream: upstreamWriter}, true
+}
+
+type serverPacketBatchWriter struct {
+	conn     *serverPacketConn
+	upstream N.VectorisedWriter
+
+	access sync.Mutex
+	writer N.VectorisedWriter
+}
+
+func (w *serverPacketBatchWriter) WritePacketBatch(buffers []*buf.Buffer, destinations []M.Socksaddr) error {
+	if len(buffers) == 0 || len(buffers) != len(destinations) {
+		buf.ReleaseMulti(buffers)
+		return os.ErrInvalid
+	}
+	w.access.Lock()
+	if w.writer == nil {
+		w.conn.writeAccess.Lock()
+		if w.conn.writer == nil {
+			err := w.conn.writeTunnelReply()
+			if err != nil {
+				w.conn.writeAccess.Unlock()
+				w.access.Unlock()
+				buf.ReleaseMulti(buffers)
+				return err
+			}
+		}
+		w.writer = w.conn.writer.CreatePacketVectorisedWriterFor(w.upstream)
+		w.conn.writeAccess.Unlock()
+	}
+	recordWriter := w.writer
+	w.access.Unlock()
+	for index, buffer := range buffers {
+		header := buf.With(buffer.ExtendHeader(w.conn.responseAddrLen(destinations[index])))
+		err := snell.WriteUDPResponseAddress(header, destinations[index])
+		if err != nil {
+			buf.ReleaseMulti(buffers)
+			return err
+		}
+	}
+	return recordWriter.WriteVectorised(buffers)
+}
+
 func (c *serverPacketConn) writeTunnelReply() error {
 	reply := [1]byte{snell.ReplyTunnel}
 	if c.writer != nil {
@@ -230,7 +281,9 @@ func (c *serverPacketConn) WaitReadPacket() (*buf.Buffer, M.Socksaddr, error) {
 }
 
 var (
-	_ N.PacketConn       = (*serverPacketConn)(nil)
-	_ N.PacketReadWaiter = (*serverPacketConn)(nil)
-	_ N.WriterWithMTU    = (*serverPacketConn)(nil)
+	_ N.PacketConn              = (*serverPacketConn)(nil)
+	_ N.PacketReadWaiter        = (*serverPacketConn)(nil)
+	_ N.PacketBatchWriteCreator = (*serverPacketConn)(nil)
+	_ N.WriterWithMTU           = (*serverPacketConn)(nil)
+	_ N.PacketBatchWriter       = (*serverPacketBatchWriter)(nil)
 )

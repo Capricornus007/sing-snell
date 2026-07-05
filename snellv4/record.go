@@ -619,21 +619,21 @@ type vectorisedWriter struct {
 
 func (w *vectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	var records []*buf.Buffer
-	defer func() {
-		buf.ReleaseMulti(buffers)
-		buf.ReleaseMulti(records)
-	}()
+	defer buf.ReleaseMulti(records)
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()
 	payloadLimit := 0
-	for _, buffer := range buffers {
+	for index, buffer := range buffers {
 		if buffer.IsEmpty() {
+			buffer.Release()
 			continue
 		}
 		if payloadLimit == 0 {
 			err := recordWriter.initialize()
 			if err != nil {
+				buffer.Release()
+				buf.ReleaseMulti(buffers[index+1:])
 				return err
 			}
 			nowUnix := time.Now().Unix()
@@ -654,12 +654,16 @@ func (w *vectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 			if len(data) == dataLen && dataLen <= payloadLimit {
 				record, err = recordWriter.makeBufferRecordLocked(buffer, paddingLen)
 				if err != nil {
+					buffer.Release()
+					buf.ReleaseMulti(buffers[index+1:])
 					return err
 				}
 				buffer = nil
 			} else {
 				record, err = recordWriter.makeSliceRecordLocked(data[:recordLen], paddingLen)
 				if err != nil {
+					buffer.Release()
+					buf.ReleaseMulti(buffers[index+1:])
 					return err
 				}
 			}
@@ -669,6 +673,60 @@ func (w *vectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 		if buffer != nil {
 			buffer.Release()
 		}
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	flushRecords := records
+	records = nil
+	return w.upstream.WriteVectorised(flushRecords)
+}
+
+func (w *writer) CreatePacketVectorisedWriterFor(upstream N.VectorisedWriter) N.VectorisedWriter {
+	return &packetVectorisedWriter{writer: w, upstream: upstream}
+}
+
+type packetVectorisedWriter struct {
+	writer   *writer
+	upstream N.VectorisedWriter
+}
+
+func (w *packetVectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
+	var records []*buf.Buffer
+	defer buf.ReleaseMulti(records)
+	recordWriter := w.writer
+	recordWriter.access.Lock()
+	defer recordWriter.access.Unlock()
+	err := recordWriter.initialize()
+	if err != nil {
+		buf.ReleaseMulti(buffers)
+		return err
+	}
+	for index, buffer := range buffers {
+		if buffer.IsEmpty() {
+			buffer.Release()
+			continue
+		}
+		nowUnix := time.Now().Unix()
+		payloadLimit := recordWriter.payloadLimitFor(nowUnix)
+		if payloadLimit <= 0 || payloadLimit > maxPayload {
+			panic("snell: invalid v4 payload limit")
+		}
+		dataLen := buffer.Len()
+		if dataLen > payloadLimit {
+			buffer.Release()
+			buf.ReleaseMulti(buffers[index+1:])
+			return snell.ErrPayloadTooLarge
+		}
+		recordWriter.advancePayloadLimit(payloadLimit, nowUnix)
+		paddingLen := recordWriter.framePaddingLen(dataLen)
+		record, err := recordWriter.makeBufferRecordLocked(buffer, paddingLen)
+		if err != nil {
+			buffer.Release()
+			buf.ReleaseMulti(buffers[index+1:])
+			return err
+		}
+		records = append(records, record)
 	}
 	if len(records) == 0 {
 		return nil
@@ -697,6 +755,13 @@ func (w *writer) WritePacketBuffer(buffer *buf.Buffer) error {
 	}
 	w.advancePayloadLimit(payloadLimit, nowUnix)
 	paddingLen := w.framePaddingLen(dataLen)
+	frontHeadroom := snell.HeaderCipherLen + paddingLen
+	if !w.saltSent {
+		frontHeadroom += snell.SaltLen
+	}
+	if buffer.Start() < frontHeadroom || buffer.FreeLen() < snell.AEADTagLen {
+		return w.writeSliceRecordLocked(buffer.Bytes(), paddingLen)
+	}
 	return w.writeBufferRecordLocked(buffer, paddingLen)
 }
 
@@ -725,6 +790,7 @@ var (
 	_ N.ExtendedWriter         = (*writer)(nil)
 	_ N.VectorisedWriteCreator = (*writer)(nil)
 	_ N.VectorisedWriter       = (*vectorisedWriter)(nil)
+	_ N.VectorisedWriter       = (*packetVectorisedWriter)(nil)
 	_ N.FrontHeadroom          = (*writer)(nil)
 	_ N.RearHeadroom           = (*writer)(nil)
 	_ N.WriterWithMTU          = (*writer)(nil)

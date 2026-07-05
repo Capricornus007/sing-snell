@@ -15,6 +15,8 @@ import (
 	snell "github.com/sagernet/sing-snell"
 	"github.com/sagernet/sing-snell/snellv4"
 	"github.com/sagernet/sing-snell/snellv5"
+	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
@@ -156,6 +158,49 @@ func TestV5TCP(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(payload, received), "payload mismatch")
 	normalScenario{address: fmt.Sprintf("127.0.0.1:%d", port), client: client}.HalfCloseEcho(t, "v5-official")
+}
+
+func TestV5TCPVectorisedWriter(t *testing.T) {
+	port := freePort(t)
+	startSnellServer(t, "v5", v5Config(testPSK, port), port)
+	echoPort := startTCPEcho(t)
+
+	client, err := snellv4.NewClient(snellv4.ClientOptions{PSK: []byte(testPSK)})
+	require.NoError(t, err)
+	serverConn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	require.NoError(t, err)
+	defer serverConn.Close()
+
+	proxyConn := client.DialEarlyConn(serverConn, M.ParseSocksaddrHostPort("127.0.0.1", echoPort))
+	vectorisedWriter, created := bufio.CreateVectorisedWriter(proxyConn)
+	require.True(t, created)
+
+	partA := make([]byte, 700)
+	partB := make([]byte, 900)
+	_, err = rand.Read(partA)
+	require.NoError(t, err)
+	_, err = rand.Read(partB)
+	require.NoError(t, err)
+	expected := append(append([]byte(nil), partA...), partB...)
+
+	frontHeadroom := N.CalculateFrontHeadroom(proxyConn)
+	rearHeadroom := N.CalculateRearHeadroom(proxyConn)
+	buffers := make([]*buf.Buffer, 2)
+	for index, payload := range [][]byte{partA, partB} {
+		buffer := buf.NewSize(frontHeadroom + len(payload) + rearHeadroom)
+		buffer.Resize(frontHeadroom, 0)
+		_, err = buffer.Write(payload)
+		require.NoError(t, err)
+		buffers[index] = buffer
+	}
+	err = vectorisedWriter.WriteVectorised(buffers)
+	require.NoError(t, err)
+
+	received := make([]byte, len(expected))
+	require.NoError(t, proxyConn.SetReadDeadline(time.Now().Add(10*time.Second)))
+	_, err = io.ReadFull(proxyConn, received)
+	require.NoError(t, err)
+	require.Equal(t, expected, received)
 }
 
 func TestV5TCPReuse(t *testing.T) {

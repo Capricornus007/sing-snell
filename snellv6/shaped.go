@@ -263,16 +263,14 @@ type vectorisedShapedWriter struct {
 
 func (w *vectorisedShapedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	var records []*buf.Buffer
-	defer func() {
-		buf.ReleaseMulti(buffers)
-		buf.ReleaseMulti(records)
-	}()
+	defer buf.ReleaseMulti(records)
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()
 	for _, buffer := range buffers {
 		dataLen := buffer.Len()
 		if dataLen == 0 {
+			buffer.Release()
 			continue
 		}
 		for data := buffer.Bytes(); len(data) > 0; {
@@ -300,6 +298,60 @@ func (w *vectorisedShapedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 }
 
 var _ N.VectorisedWriter = (*vectorisedShapedWriter)(nil)
+
+func (w *shapedWriter) CreatePacketVectorisedWriterFor(upstream N.VectorisedWriter) N.VectorisedWriter {
+	return &packetVectorisedShapedWriter{writer: w, upstream: upstream}
+}
+
+type packetVectorisedShapedWriter struct {
+	writer   *shapedWriter
+	upstream N.VectorisedWriter
+}
+
+func (w *packetVectorisedShapedWriter) WriteVectorised(buffers []*buf.Buffer) error {
+	var records []*buf.Buffer
+	defer buf.ReleaseMulti(records)
+	recordWriter := w.writer
+	recordWriter.access.Lock()
+	defer recordWriter.access.Unlock()
+	for index, buffer := range buffers {
+		if buffer.IsEmpty() {
+			buffer.Release()
+			continue
+		}
+		dataLen := buffer.Len()
+		nowUnix := time.Now().Unix()
+		chunkSize := recordWriter.chunkSize
+		if recordWriter.lastWriteUnix == 0 || nowUnix-recordWriter.lastWriteUnix > int64(recordWriter.profile.idleResetSec) {
+			chunkSize = recordWriter.profile.chunkInitial
+		}
+		if chunkSize == 0 {
+			chunkSize = recordWriter.profile.chunkInitial
+		}
+		payloadLimit := recordWriter.profile.chunkPayloadLimit(recordWriter.seq, chunkSize)
+		if recordWriter.seq == 0 {
+			payloadLimit = min(payloadLimit, recordWriter.profile.firstRecordCap)
+		}
+		payloadLimit = max(1, min(payloadLimit, maxPayload))
+		if dataLen > payloadLimit {
+			buffer.Release()
+			buf.ReleaseMulti(buffers[index+1:])
+			return snell.ErrPayloadTooLarge
+		}
+		recordWriter.chunkSize = recordWriter.profile.nextChunkSize(chunkSize)
+		recordWriter.lastWriteUnix = nowUnix
+		record := recordWriter.makeBufferRecord(buffer)
+		records = append(records, record)
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	flushRecords := records
+	records = nil
+	return w.upstream.WriteVectorised(flushRecords)
+}
+
+var _ N.VectorisedWriter = (*packetVectorisedShapedWriter)(nil)
 
 func (w *shapedWriter) FrontHeadroom() int {
 	headroom := w.profile.recordPrefixMax + snell.HeaderCipherLen + w.profile.padMaxHeadroom

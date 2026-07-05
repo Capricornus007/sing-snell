@@ -299,16 +299,14 @@ type vectorisedUnshapedWriter struct {
 
 func (w *vectorisedUnshapedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	var records []*buf.Buffer
-	defer func() {
-		buf.ReleaseMulti(buffers)
-		buf.ReleaseMulti(records)
-	}()
+	defer buf.ReleaseMulti(records)
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()
 	for _, buffer := range buffers {
 		dataLen := buffer.Len()
 		if dataLen == 0 {
+			buffer.Release()
 			continue
 		}
 		for data := buffer.Bytes(); len(data) > 0; {
@@ -325,6 +323,42 @@ func (w *vectorisedUnshapedWriter) WriteVectorised(buffers []*buf.Buffer) error 
 		if buffer != nil {
 			buffer.Release()
 		}
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	flushRecords := records
+	records = nil
+	return w.upstream.WriteVectorised(flushRecords)
+}
+
+func (w *unshapedWriter) CreatePacketVectorisedWriterFor(upstream N.VectorisedWriter) N.VectorisedWriter {
+	return &packetVectorisedUnshapedWriter{writer: w, upstream: upstream}
+}
+
+type packetVectorisedUnshapedWriter struct {
+	writer   *unshapedWriter
+	upstream N.VectorisedWriter
+}
+
+func (w *packetVectorisedUnshapedWriter) WriteVectorised(buffers []*buf.Buffer) error {
+	var records []*buf.Buffer
+	defer buf.ReleaseMulti(records)
+	recordWriter := w.writer
+	recordWriter.access.Lock()
+	defer recordWriter.access.Unlock()
+	for index, buffer := range buffers {
+		if buffer.IsEmpty() {
+			buffer.Release()
+			continue
+		}
+		if buffer.Len() > maxPayload {
+			buffer.Release()
+			buf.ReleaseMulti(buffers[index+1:])
+			return snell.ErrPayloadTooLarge
+		}
+		record := recordWriter.makeBufferRecordLocked(buffer)
+		records = append(records, record)
 	}
 	if len(records) == 0 {
 		return nil
@@ -488,16 +522,14 @@ type vectorisedRawWriter struct {
 
 func (w *vectorisedRawWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	var records []*buf.Buffer
-	defer func() {
-		buf.ReleaseMulti(buffers)
-		buf.ReleaseMulti(records)
-	}()
+	defer buf.ReleaseMulti(records)
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()
 	for _, buffer := range buffers {
 		dataLen := buffer.Len()
 		if dataLen == 0 {
+			buffer.Release()
 			continue
 		}
 		for data := buffer.Bytes(); len(data) > 0; {
@@ -514,6 +546,42 @@ func (w *vectorisedRawWriter) WriteVectorised(buffers []*buf.Buffer) error {
 		if buffer != nil {
 			buffer.Release()
 		}
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	flushRecords := records
+	records = nil
+	return w.upstream.WriteVectorised(flushRecords)
+}
+
+func (w *rawWriter) CreatePacketVectorisedWriterFor(upstream N.VectorisedWriter) N.VectorisedWriter {
+	return &packetVectorisedRawWriter{writer: w, upstream: upstream}
+}
+
+type packetVectorisedRawWriter struct {
+	writer   *rawWriter
+	upstream N.VectorisedWriter
+}
+
+func (w *packetVectorisedRawWriter) WriteVectorised(buffers []*buf.Buffer) error {
+	var records []*buf.Buffer
+	defer buf.ReleaseMulti(records)
+	recordWriter := w.writer
+	recordWriter.access.Lock()
+	defer recordWriter.access.Unlock()
+	for index, buffer := range buffers {
+		if buffer.IsEmpty() {
+			buffer.Release()
+			continue
+		}
+		if buffer.Len() > maxPayload {
+			buffer.Release()
+			buf.ReleaseMulti(buffers[index+1:])
+			return snell.ErrPayloadTooLarge
+		}
+		record := recordWriter.makeBufferRecordLocked(buffer)
+		records = append(records, record)
 	}
 	if len(records) == 0 {
 		return nil
@@ -555,12 +623,14 @@ var (
 	_ N.ExtendedWriter         = (*unshapedWriter)(nil)
 	_ N.VectorisedWriteCreator = (*unshapedWriter)(nil)
 	_ N.VectorisedWriter       = (*vectorisedUnshapedWriter)(nil)
+	_ N.VectorisedWriter       = (*packetVectorisedUnshapedWriter)(nil)
 	_ N.FrontHeadroom          = (*unshapedWriter)(nil)
 	_ N.ExtendedReader         = (*rawReader)(nil)
 	_ N.ReadWaiter             = (*rawReader)(nil)
 	_ N.ExtendedWriter         = (*rawWriter)(nil)
 	_ N.VectorisedWriteCreator = (*rawWriter)(nil)
 	_ N.VectorisedWriter       = (*vectorisedRawWriter)(nil)
+	_ N.VectorisedWriter       = (*packetVectorisedRawWriter)(nil)
 	_ N.VectorisedWriteCreator = (*shapedWriter)(nil)
 	_ N.WriterWithMTU          = (*unshapedWriter)(nil)
 	_ N.WriterWithMTU          = (*rawWriter)(nil)

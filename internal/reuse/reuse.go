@@ -242,6 +242,7 @@ type RecordWriter interface {
 	N.ExtendedWriter
 	N.VectorisedWriteCreator
 	CreateVectorisedWriterFor(upstream N.VectorisedWriter) N.VectorisedWriter
+	CreatePacketVectorisedWriterFor(upstream N.VectorisedWriter) N.VectorisedWriter
 	WritePacketBuffer(buffer *buf.Buffer) error
 	WriteZeroChunk() error
 	FrontHeadroom() int
