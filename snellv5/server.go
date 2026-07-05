@@ -480,9 +480,32 @@ func (c *serverConn) writeErrorResponse(code byte, messageText string) error {
 }
 
 func (c *serverConn) writeResponseBuffer(buffer *buf.Buffer) error {
-	err := c.writeResponse(buffer.Bytes())
+	buffer.ExtendHeader(1)[0] = snell.ReplyTunnel
+	salt := make([]byte, snell.SaltLen)
+	_, err := io.ReadFull(rand.Reader, salt)
+	if err != nil {
+		buffer.Release()
+		return err
+	}
+	key := snell.DeriveKey(c.service.psk, salt)
+	aead, err := snell.NewAEAD(key)
+	if err != nil {
+		buffer.Release()
+		return err
+	}
+	nonce := make([]byte, snell.NonceLen)
+	writer, err := newWriter(c.Conn, aead, nonce)
+	if err != nil {
+		buffer.Release()
+		return err
+	}
+	err = writer.WriteFirst(salt, buffer.Bytes())
 	buffer.Release()
-	return err
+	if err != nil {
+		return E.Cause(err, "write reply")
+	}
+	c.writer = writer
+	return nil
 }
 
 func (c *serverConn) Read(p []byte) (int, error) {

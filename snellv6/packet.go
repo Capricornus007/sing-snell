@@ -14,7 +14,10 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
-const maxUDPHeadroom = snell.HeaderCipherLen + 1 + 1 + 255 + 2
+const (
+	maxUDPRequestHeaderLen  = 1 + 1 + 255 + 2
+	maxUDPResponseHeaderLen = 1 + 16 + 2
+)
 
 func (c *clientPacketConn) udpRequestAddrLen(destination M.Socksaddr) int {
 	if destination.IsIP() {
@@ -135,7 +138,14 @@ func (c *clientPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
 }
 
 func (c *clientPacketConn) FrontHeadroom() int {
-	return maxUDPHeadroom
+	switch c.client.mode {
+	case ModeUnsafeRaw:
+		return snell.HeaderPlainLen + maxUDPRequestHeaderLen
+	case ModeUnshaped:
+		return snell.HeaderCipherLen + maxUDPRequestHeaderLen
+	default:
+		return c.client.profile.recordPrefixMax + snell.HeaderCipherLen + c.client.profile.padMaxHeadroom + maxUDPRequestHeaderLen
+	}
 }
 
 func (c *clientPacketConn) RearHeadroom() int {
@@ -143,6 +153,26 @@ func (c *clientPacketConn) RearHeadroom() int {
 		return 0
 	}
 	return snell.AEADTagLen
+}
+
+func (c *clientPacketConn) WriterMTU() int {
+	switch c.client.mode {
+	case ModeUnsafeRaw, ModeUnshaped:
+		return maxPayload - maxUDPRequestHeaderLen
+	default:
+		payloadLimit := c.client.profile.chunkInitial
+		switch c.client.profile.chunkPolicy {
+		case 1:
+			payloadLimit = c.client.profile.chunkBuckets[0]
+			for _, chunkBucket := range c.client.profile.chunkBuckets[1:] {
+				payloadLimit = min(payloadLimit, chunkBucket)
+			}
+		case 2:
+			payloadLimit -= c.client.profile.chunkJitter
+		}
+		payloadLimit = max(0x40, min(payloadLimit, c.client.profile.chunkMax))
+		return max(1, payloadLimit-maxUDPRequestHeaderLen)
+	}
 }
 
 func (c *clientPacketConn) Upstream() any {
@@ -265,7 +295,14 @@ func (c *serverPacketConn) writeTunnelReply() error {
 }
 
 func (c *serverPacketConn) FrontHeadroom() int {
-	return maxUDPHeadroom
+	switch c.service.mode {
+	case ModeUnsafeRaw:
+		return snell.HeaderPlainLen + maxUDPResponseHeaderLen
+	case ModeUnshaped:
+		return snell.HeaderCipherLen + maxUDPResponseHeaderLen
+	default:
+		return c.service.profile.recordPrefixMax + snell.HeaderCipherLen + c.service.profile.padMaxHeadroom + maxUDPResponseHeaderLen
+	}
 }
 
 func (c *serverPacketConn) RearHeadroom() int {
@@ -273,6 +310,26 @@ func (c *serverPacketConn) RearHeadroom() int {
 		return 0
 	}
 	return snell.AEADTagLen
+}
+
+func (c *serverPacketConn) WriterMTU() int {
+	switch c.service.mode {
+	case ModeUnsafeRaw, ModeUnshaped:
+		return maxPayload - maxUDPResponseHeaderLen
+	default:
+		payloadLimit := c.service.profile.chunkInitial
+		switch c.service.profile.chunkPolicy {
+		case 1:
+			payloadLimit = c.service.profile.chunkBuckets[0]
+			for _, chunkBucket := range c.service.profile.chunkBuckets[1:] {
+				payloadLimit = min(payloadLimit, chunkBucket)
+			}
+		case 2:
+			payloadLimit -= c.service.profile.chunkJitter
+		}
+		payloadLimit = max(0x40, min(payloadLimit, c.service.profile.chunkMax))
+		return max(1, payloadLimit-maxUDPResponseHeaderLen)
+	}
 }
 
 func (c *serverPacketConn) Upstream() any {
@@ -310,6 +367,8 @@ func (c *serverPacketConn) WaitReadPacket() (*buf.Buffer, M.Socksaddr, error) {
 var (
 	_ N.PacketConn       = (*clientPacketConn)(nil)
 	_ N.PacketReadWaiter = (*clientPacketConn)(nil)
+	_ N.WriterWithMTU    = (*clientPacketConn)(nil)
 	_ N.PacketConn       = (*serverPacketConn)(nil)
 	_ N.PacketReadWaiter = (*serverPacketConn)(nil)
+	_ N.WriterWithMTU    = (*serverPacketConn)(nil)
 )

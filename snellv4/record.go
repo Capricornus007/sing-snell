@@ -414,9 +414,6 @@ func (w *writer) makeBufferRecordLocked(buffer *buf.Buffer, paddingLen int) (*bu
 		saltLen = snell.SaltLen
 	}
 	frontLen := saltLen + snell.HeaderCipherLen + paddingLen
-	if buffer.Start() < frontLen || buffer.FreeLen() < snell.AEADTagLen {
-		return w.makeSliceRecordLocked(buffer.Bytes(), paddingLen)
-	}
 	prefix := buffer.ExtendHeader(frontLen)
 	if saltLen > 0 {
 		copy(prefix[:saltLen], w.salt)
@@ -432,8 +429,8 @@ func (w *writer) makeBufferRecordLocked(buffer *buf.Buffer, paddingLen int) (*bu
 	snell.IncreaseNonce(w.nonce)
 	if dataLen > 0 {
 		payloadCipher := buffer.From(frontLen)
-		w.cipher.Seal(payloadCipher[:0], w.nonce, payloadCipher[:dataLen], nil)
 		buffer.Extend(snell.AEADTagLen)
+		w.cipher.Seal(payloadCipher[:0], w.nonce, payloadCipher[:dataLen], nil)
 		snell.IncreaseNonce(w.nonce)
 		if paddingLen > 0 {
 			padding := prefix[saltLen+snell.HeaderCipherLen:]
@@ -656,14 +653,15 @@ func (w *vectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 			var err error
 			if len(data) == dataLen && dataLen <= payloadLimit {
 				record, err = recordWriter.makeBufferRecordLocked(buffer, paddingLen)
-				if record == buffer {
-					buffer = nil
+				if err != nil {
+					return err
 				}
+				buffer = nil
 			} else {
 				record, err = recordWriter.makeSliceRecordLocked(data[:recordLen], paddingLen)
-			}
-			if err != nil {
-				return err
+				if err != nil {
+					return err
+				}
 			}
 			data = data[recordLen:]
 			records = append(records, record)
@@ -683,13 +681,23 @@ func (w *vectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 func (w *writer) WritePacketBuffer(buffer *buf.Buffer) error {
 	defer buffer.Release()
 	dataLen := buffer.Len()
-	if dataLen > maxPayload {
-		return snell.ErrPayloadTooLarge
-	}
 	w.access.Lock()
 	defer w.access.Unlock()
-	_, err := w.writeBytesLocked(buffer.Bytes())
-	return err
+	err := w.initialize()
+	if err != nil {
+		return err
+	}
+	nowUnix := time.Now().Unix()
+	payloadLimit := w.payloadLimitFor(nowUnix)
+	if payloadLimit <= 0 || payloadLimit > maxPayload {
+		panic("snell: invalid v4 payload limit")
+	}
+	if dataLen > payloadLimit {
+		return snell.ErrPayloadTooLarge
+	}
+	w.advancePayloadLimit(payloadLimit, nowUnix)
+	paddingLen := w.framePaddingLen(dataLen)
+	return w.writeBufferRecordLocked(buffer, paddingLen)
 }
 
 func (w *writer) FrontHeadroom() int {

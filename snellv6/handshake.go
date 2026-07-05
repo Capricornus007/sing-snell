@@ -116,7 +116,7 @@ func writeFirstRecordBuffer(conn io.Writer, mode Mode, psk []byte, profile *Prof
 		}
 		return writer, nil
 	case ModeUnshaped:
-		if buffer.Start() < snell.SaltLen+snell.HeaderCipherLen || buffer.FreeLen() < snell.AEADTagLen || buffer.Len() > maxPayload {
+		if buffer.Len() > maxPayload {
 			writer, err := writeFirstRecord(conn, mode, psk, profile, buffer.Bytes())
 			buffer.Release()
 			if err != nil {
@@ -142,8 +142,8 @@ func writeFirstRecordBuffer(conn io.Writer, mode Mode, psk []byte, profile *Prof
 		writer := newUnshapedWriter(conn, aead, nonce)
 		writer.sealHeader(record[snell.SaltLen:], buffer.Len()-(snell.SaltLen+snell.HeaderCipherLen))
 		payloadCipher := buffer.From(snell.SaltLen + snell.HeaderCipherLen)
-		aead.Seal(payloadCipher[:0], nonce, payloadCipher, nil)
 		buffer.Extend(snell.AEADTagLen)
+		aead.Seal(payloadCipher[:0], nonce, payloadCipher, nil)
 		snell.IncreaseNonce(nonce)
 		_, err = conn.Write(buffer.Bytes())
 		buffer.Release()

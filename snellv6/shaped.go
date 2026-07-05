@@ -85,14 +85,7 @@ func (w *shapedWriter) makeBufferRecord(buffer *buf.Buffer) *buf.Buffer {
 		saltPrefixLen = saltBlockLen - saltLen
 	}
 	paddingLen := w.profile.paddingLen(w.seq, dataLen, prefixLen, saltPrefixLen, saltBlockLen)
-	payloadCipherLen := 0
-	if dataLen > 0 {
-		payloadCipherLen = dataLen + snell.AEADTagLen
-	}
 	frontLen := saltBlockLen + prefixLen + snell.HeaderCipherLen + paddingLen
-	if buffer.Start() < frontLen || buffer.FreeLen() < payloadCipherLen-dataLen {
-		return w.makeSliceRecord(buffer.Bytes())
-	}
 	front := buffer.ExtendHeader(frontLen)
 	if saltBlockLen > 0 {
 		block := front[:saltBlockLen]
@@ -114,8 +107,8 @@ func (w *shapedWriter) makeBufferRecord(buffer *buf.Buffer) *buf.Buffer {
 	w.profile.fillPadding(w.seq, padding)
 	if dataLen > 0 {
 		region := buffer.From(frontLen)
-		w.cipher.Seal(region[:0], w.nonce, region[:dataLen], padding)
 		buffer.Extend(snell.AEADTagLen)
+		w.cipher.Seal(region[:0], w.nonce, region[:dataLen], padding)
 		snell.IncreaseNonce(w.nonce)
 		region = buffer.From(frontLen)
 		w.profile.mixPaddingPayload(w.seq, padding, region)
@@ -191,11 +184,8 @@ func (w *shapedWriter) WriteBuffer(buffer *buf.Buffer) error {
 	now := time.Now()
 	payloadLimit := w.payloadLimitFor(now)
 	if dataLen <= payloadLimit {
-		record := w.makeBufferRecord(buffer)
-		_, err := w.upstream.Write(record.Bytes())
-		if record != buffer {
-			record.Release()
-		}
+		w.makeBufferRecord(buffer)
+		_, err := w.upstream.Write(buffer.Bytes())
 		return err
 	}
 	var records []*buf.Buffer
@@ -212,7 +202,36 @@ func (w *shapedWriter) WriteBuffer(buffer *buf.Buffer) error {
 }
 
 func (w *shapedWriter) WritePacketBuffer(buffer *buf.Buffer) error {
-	return w.WriteBuffer(buffer)
+	dataLen := buffer.Len()
+	if dataLen == 0 {
+		buffer.Release()
+		return nil
+	}
+	w.access.Lock()
+	defer w.access.Unlock()
+	nowUnix := time.Now().Unix()
+	chunkSize := w.chunkSize
+	if w.lastWriteUnix == 0 || nowUnix-w.lastWriteUnix > int64(w.profile.idleResetSec) {
+		chunkSize = w.profile.chunkInitial
+	}
+	if chunkSize == 0 {
+		chunkSize = w.profile.chunkInitial
+	}
+	payloadLimit := w.profile.chunkPayloadLimit(w.seq, chunkSize)
+	if w.seq == 0 {
+		payloadLimit = min(payloadLimit, w.profile.firstRecordCap)
+	}
+	payloadLimit = max(1, min(payloadLimit, maxPayload))
+	if dataLen > payloadLimit {
+		buffer.Release()
+		return snell.ErrPayloadTooLarge
+	}
+	w.chunkSize = w.profile.nextChunkSize(chunkSize)
+	w.lastWriteUnix = nowUnix
+	record := w.makeBufferRecord(buffer)
+	_, err := w.upstream.Write(record.Bytes())
+	record.Release()
+	return err
 }
 
 func (w *shapedWriter) WriteZeroChunk() error {
@@ -261,9 +280,7 @@ func (w *vectorisedShapedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 			recordLen := min(len(data), payloadLimit)
 			if len(data) == dataLen && dataLen <= payloadLimit {
 				record := recordWriter.makeBufferRecord(buffer)
-				if record == buffer {
-					buffer = nil
-				}
+				buffer = nil
 				records = append(records, record)
 				break
 			}

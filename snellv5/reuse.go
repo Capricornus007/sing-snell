@@ -193,18 +193,6 @@ func (c *serverReuseConn[U]) writeResponse(payload []byte) error {
 
 func (c *serverReuseConn[U]) writeResponseBuffer(buffer *buf.Buffer) error {
 	if c.session.writer != nil {
-		if buffer.Start() < 1 {
-			reply := buf.NewSize(1 + buffer.Len())
-			common.Must(reply.WriteByte(snell.ReplyTunnel))
-			common.Must1(reply.Write(buffer.Bytes()))
-			buffer.Release()
-			err := c.session.writer.WriteBuffer(reply)
-			if err != nil {
-				return E.Cause(err, "write reply")
-			}
-			c.replyWritten = true
-			return nil
-		}
 		buffer.ExtendHeader(1)[0] = snell.ReplyTunnel
 		err := c.session.writer.WriteBuffer(buffer)
 		if err != nil {
@@ -213,9 +201,33 @@ func (c *serverReuseConn[U]) writeResponseBuffer(buffer *buf.Buffer) error {
 		c.replyWritten = true
 		return nil
 	}
-	err := c.writeResponse(buffer.Bytes())
+	buffer.ExtendHeader(1)[0] = snell.ReplyTunnel
+	salt := make([]byte, snell.SaltLen)
+	_, err := io.ReadFull(rand.Reader, salt)
+	if err != nil {
+		buffer.Release()
+		return err
+	}
+	key := snell.DeriveKey(c.session.service.psk, salt)
+	aead, err := snell.NewAEAD(key)
+	if err != nil {
+		buffer.Release()
+		return err
+	}
+	nonce := make([]byte, snell.NonceLen)
+	writer, err := newWriter(c.session.Conn, aead, nonce)
+	if err != nil {
+		buffer.Release()
+		return err
+	}
+	err = writer.WriteFirst(salt, buffer.Bytes())
 	buffer.Release()
-	return err
+	if err != nil {
+		return E.Cause(err, "write reply")
+	}
+	c.session.writer = writer
+	c.replyWritten = true
+	return nil
 }
 
 func (c *serverReuseConn[U]) writeErrorResponse(code byte, messageText string) error {

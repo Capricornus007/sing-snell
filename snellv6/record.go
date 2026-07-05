@@ -248,13 +248,11 @@ func (w *unshapedWriter) makeSliceRecordLocked(payload []byte) *buf.Buffer {
 
 func (w *unshapedWriter) makeBufferRecordLocked(buffer *buf.Buffer) *buf.Buffer {
 	dataLen := buffer.Len()
-	if buffer.Start() < snell.HeaderCipherLen || buffer.FreeLen() < snell.AEADTagLen {
-		return w.makeSliceRecordLocked(buffer.Bytes())
-	}
 	header := buffer.ExtendHeader(snell.HeaderCipherLen)
 	w.sealHeader(header, dataLen)
-	w.cipher.Seal(buffer.From(snell.HeaderCipherLen)[:0], w.nonce, buffer.From(snell.HeaderCipherLen), nil)
+	payloadCipher := buffer.From(snell.HeaderCipherLen)
 	buffer.Extend(snell.AEADTagLen)
+	w.cipher.Seal(payloadCipher[:0], w.nonce, payloadCipher[:dataLen], nil)
 	snell.IncreaseNonce(w.nonce)
 	return buffer
 }
@@ -270,14 +268,15 @@ func (w *unshapedWriter) WriteBuffer(buffer *buf.Buffer) error {
 	}
 	w.access.Lock()
 	defer w.access.Unlock()
-	record := w.makeBufferRecordLocked(buffer)
-	if record != buffer {
-		defer record.Release()
-	}
-	return common.Error(w.upstream.Write(record.Bytes()))
+	w.makeBufferRecordLocked(buffer)
+	return common.Error(w.upstream.Write(buffer.Bytes()))
 }
 
 func (w *unshapedWriter) WritePacketBuffer(buffer *buf.Buffer) error {
+	if buffer.Len() > maxPayload {
+		buffer.Release()
+		return snell.ErrPayloadTooLarge
+	}
 	return w.WriteBuffer(buffer)
 }
 
@@ -315,9 +314,7 @@ func (w *vectorisedUnshapedWriter) WriteVectorised(buffers []*buf.Buffer) error 
 		for data := buffer.Bytes(); len(data) > 0; {
 			if len(data) == dataLen && dataLen <= maxPayload {
 				record := recordWriter.makeBufferRecordLocked(buffer)
-				if record == buffer {
-					buffer = nil
-				}
+				buffer = nil
 				records = append(records, record)
 				break
 			}
@@ -445,9 +442,6 @@ func (w *rawWriter) makeSliceRecordLocked(payload []byte) *buf.Buffer {
 
 func (w *rawWriter) makeBufferRecordLocked(buffer *buf.Buffer) *buf.Buffer {
 	dataLen := buffer.Len()
-	if buffer.Start() < snell.HeaderPlainLen {
-		return w.makeSliceRecordLocked(buffer.Bytes())
-	}
 	putHeader(buffer.ExtendHeader(snell.HeaderPlainLen), 0, dataLen)
 	return buffer
 }
@@ -463,14 +457,15 @@ func (w *rawWriter) WriteBuffer(buffer *buf.Buffer) error {
 	}
 	w.access.Lock()
 	defer w.access.Unlock()
-	record := w.makeBufferRecordLocked(buffer)
-	if record != buffer {
-		defer record.Release()
-	}
-	return common.Error(w.upstream.Write(record.Bytes()))
+	w.makeBufferRecordLocked(buffer)
+	return common.Error(w.upstream.Write(buffer.Bytes()))
 }
 
 func (w *rawWriter) WritePacketBuffer(buffer *buf.Buffer) error {
+	if buffer.Len() > maxPayload {
+		buffer.Release()
+		return snell.ErrPayloadTooLarge
+	}
 	return w.WriteBuffer(buffer)
 }
 
@@ -508,9 +503,7 @@ func (w *vectorisedRawWriter) WriteVectorised(buffers []*buf.Buffer) error {
 		for data := buffer.Bytes(); len(data) > 0; {
 			if len(data) == dataLen && dataLen <= maxPayload {
 				record := recordWriter.makeBufferRecordLocked(buffer)
-				if record == buffer {
-					buffer = nil
-				}
+				buffer = nil
 				records = append(records, record)
 				break
 			}

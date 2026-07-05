@@ -605,36 +605,11 @@ func (c *serverReuseConn[U]) writeResponse(payload []byte) error {
 
 func (c *serverReuseConn[U]) writeResponseBuffer(buffer *buf.Buffer) error {
 	if c.session.writer != nil {
-		if buffer.Start() < 1 {
-			reply := buf.NewSize(1 + buffer.Len())
-			reply.Extend(1)[0] = snell.ReplyTunnel
-			copy(reply.Extend(buffer.Len()), buffer.Bytes())
-			buffer.Release()
-			err := c.session.writer.WriteBuffer(reply)
-			if err != nil {
-				return E.Cause(err, "write reply")
-			}
-			c.replyWritten = true
-			return nil
-		}
 		buffer.ExtendHeader(1)[0] = snell.ReplyTunnel
 		err := c.session.writer.WriteBuffer(buffer)
 		if err != nil {
 			return E.Cause(err, "write reply")
 		}
-		c.replyWritten = true
-		return nil
-	}
-	if buffer.Start() < 1 {
-		reply := buf.NewSize(1 + buffer.Len())
-		reply.Extend(1)[0] = snell.ReplyTunnel
-		copy(reply.Extend(buffer.Len()), buffer.Bytes())
-		buffer.Release()
-		writer, err := writeFirstRecordBuffer(c.session.Conn, c.session.service.mode, c.session.service.psk, c.session.service.profile, reply)
-		if err != nil {
-			return E.Cause(err, "write reply")
-		}
-		c.session.writer = writer
 		c.replyWritten = true
 		return nil
 	}

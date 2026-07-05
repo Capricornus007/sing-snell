@@ -390,15 +390,12 @@ func (w *writer) makeBufferRecordLocked(buffer *buf.Buffer, paddingLen int) (*bu
 	if dataLen == 0 && paddingLen != 0 {
 		panic("snell: zero-length v5 record carries padding")
 	}
-	if buffer.Start() < snell.HeaderCipherLen+paddingLen || buffer.FreeLen() < snell.AEADTagLen {
-		return w.makeSliceRecordLocked(buffer.Bytes(), paddingLen)
-	}
 	prefix := buffer.ExtendHeader(snell.HeaderCipherLen + paddingLen)
 	header := prefix[:snell.HeaderCipherLen]
 	w.sealHeader(header, paddingLen, dataLen)
 	payloadCipher := buffer.From(snell.HeaderCipherLen + paddingLen)
-	w.cipher.Seal(payloadCipher[:0], w.nonce, payloadCipher, nil)
 	buffer.Extend(snell.AEADTagLen)
+	w.cipher.Seal(payloadCipher[:0], w.nonce, payloadCipher, nil)
 	payloadCipher = buffer.From(snell.HeaderCipherLen + paddingLen)
 	snell.IncreaseNonce(w.nonce)
 	if paddingLen > 0 {
@@ -444,18 +441,39 @@ func (w *writer) WriteBuffer(buffer *buf.Buffer) error {
 	if err != nil {
 		return err
 	}
-	if record != buffer {
-		defer record.Release()
-	}
+	defer record.Release()
 	return common.Error(w.upstream.Write(record.Bytes()))
 }
 
 func (w *writer) WritePacketBuffer(buffer *buf.Buffer) error {
-	if buffer.Len() > maxPayload {
+	dataLen := buffer.Len()
+	w.access.Lock()
+	defer w.access.Unlock()
+	now := time.Now().Unix()
+	var payloadLimit int
+	if w.lastFrameUnix == 0 {
+		payloadLimit = frameSize - firstRecordOverhead - w.initialPaddingLen
+	} else if now-w.lastFrameUnix < framePayloadResetInterval {
+		payloadLimit = w.framePayloadLen
+		if payloadLimit == 0 {
+			payloadLimit = framePayloadStep
+		}
+	} else {
+		payloadLimit = framePayloadStep
+	}
+	if dataLen > payloadLimit {
 		buffer.Release()
 		return snell.ErrPayloadTooLarge
 	}
-	return w.WriteBuffer(buffer)
+	w.lastFrameUnix = now
+	w.markPayloadLimitUsed(payloadLimit)
+	record, err := w.makeBufferRecordLocked(buffer, 0)
+	if err != nil {
+		buffer.Release()
+		return err
+	}
+	defer record.Release()
+	return common.Error(w.upstream.Write(record.Bytes()))
 }
 
 func (w *writer) WriteZeroChunk() error {
@@ -587,9 +605,7 @@ func (w *vectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 				if err != nil {
 					return err
 				}
-				if record == buffer {
-					buffer = nil
-				}
+				buffer = nil
 				records = append(records, record)
 				break
 			}

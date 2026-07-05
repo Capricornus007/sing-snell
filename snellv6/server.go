@@ -308,18 +308,6 @@ func (c *serverConn) writeResponse(payload []byte) error {
 }
 
 func (c *serverConn) writeResponseBuffer(buffer *buf.Buffer) error {
-	if buffer.Start() < 1 {
-		reply := buf.NewSize(1 + buffer.Len())
-		reply.Extend(1)[0] = snell.ReplyTunnel
-		copy(reply.Extend(buffer.Len()), buffer.Bytes())
-		buffer.Release()
-		writer, err := writeFirstRecordBuffer(c.Conn, c.service.mode, c.service.psk, c.service.profile, reply)
-		if err != nil {
-			return E.Cause(err, "write reply")
-		}
-		c.writer = writer
-		return nil
-	}
 	buffer.ExtendHeader(1)[0] = snell.ReplyTunnel
 	writer, err := writeFirstRecordBuffer(c.Conn, c.service.mode, c.service.psk, c.service.profile, buffer)
 	if err != nil {

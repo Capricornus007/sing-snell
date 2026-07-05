@@ -118,14 +118,6 @@ func (c *clientConn) writeRequest(payload []byte) error {
 
 func (c *clientConn) writeRequestBuffer(buffer *buf.Buffer) error {
 	requestPayload := snell.Request{Command: snell.CommandConnectV2, ClientID: c.client.userKey, Destination: c.destination}
-	if buffer.Start() < requestPayload.Len() {
-		err := c.writeRequest(nil)
-		if err != nil {
-			buffer.Release()
-			return err
-		}
-		return c.writer.WriteBuffer(buffer)
-	}
 	request := buf.With(buffer.ExtendHeader(requestPayload.Len()))
 	err := requestPayload.Write(request)
 	if err != nil {

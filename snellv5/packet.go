@@ -16,7 +16,10 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
-const maxUDPHeadroom = snell.SaltLen + snell.HeaderCipherLen + 1 + 1 + 255 + 2
+const (
+	maxUDPResponseHeaderLen = 1 + 16 + 2
+	minUDPPayloadLimit      = framePayloadStep
+)
 
 type serverPacketConn struct {
 	net.Conn
@@ -183,11 +186,15 @@ func (c *serverPacketConn) writeTunnelReply() error {
 }
 
 func (c *serverPacketConn) FrontHeadroom() int {
-	return maxUDPHeadroom
+	return snell.HeaderCipherLen + maxUDPResponseHeaderLen
 }
 
 func (c *serverPacketConn) RearHeadroom() int {
 	return snell.AEADTagLen
+}
+
+func (c *serverPacketConn) WriterMTU() int {
+	return minUDPPayloadLimit - maxUDPResponseHeaderLen
 }
 
 func (c *serverPacketConn) Upstream() any {
@@ -225,4 +232,5 @@ func (c *serverPacketConn) WaitReadPacket() (*buf.Buffer, M.Socksaddr, error) {
 var (
 	_ N.PacketConn       = (*serverPacketConn)(nil)
 	_ N.PacketReadWaiter = (*serverPacketConn)(nil)
+	_ N.WriterWithMTU    = (*serverPacketConn)(nil)
 )
