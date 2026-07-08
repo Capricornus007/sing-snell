@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/sagernet/sing-snell/snellv4"
 	"github.com/sagernet/sing-snell/snellv5"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
@@ -128,6 +130,122 @@ func roundTripPacket(t *testing.T, packetConn N.NetPacketConn, serverConn net.Co
 	require.True(t, bytes.Equal(message, received[:n]), label)
 }
 
+func TestV5ServerReuseHandlerCloseBeforeClientEOF(t *testing.T) {
+	service, err := snellv5.NewService(snellv5.ServiceOptions{
+		PSK:     []byte(testPSK),
+		Handler: partialEchoHandler{echoLen: 4 * 1024},
+	})
+	require.NoError(t, err)
+	serviceAddress := startLocalSnellService(t, service)
+	var proxy countingTCPProxy
+	proxy.Start(t, serviceAddress)
+	reuseClient, err := snellv4.NewClient(snellv4.ClientOptions{
+		PSK:    []byte(testPSK),
+		Reuse:  true,
+		Dialer: N.SystemDialer,
+		Server: M.ParseSocksaddr(proxy.address),
+	})
+	require.NoError(t, err)
+	defer reuseClient.Close()
+	scenario := reuseScenario{client: reuseClient, destination: M.ParseSocksaddrHostPort("127.0.0.1", 443)}
+	scenario.PartialEchoRoundTrip(t, "v5-server-drain-1", 8*1024, 4*1024)
+	scenario.PartialEchoRoundTrip(t, "v5-server-drain-2", 8*1024, 4*1024)
+	require.Equal(t, int32(1), proxy.count.Load())
+}
+
+func TestV5ServerReuseCloseWhileReadActive(t *testing.T) {
+	handler := &closeWhileReadActiveHandler{
+		readStarted: make(chan struct{}),
+		closeDone:   make(chan struct{}),
+	}
+	service, err := snellv5.NewService(snellv5.ServiceOptions{
+		PSK:     []byte(testPSK),
+		Handler: handler,
+	})
+	require.NoError(t, err)
+	serviceAddress := startLocalSnellService(t, service)
+	var proxy countingTCPProxy
+	proxy.Start(t, serviceAddress)
+	client, err := snellv4.NewClient(snellv4.ClientOptions{
+		PSK:    []byte(testPSK),
+		Reuse:  true,
+		Dialer: N.SystemDialer,
+		Server: M.ParseSocksaddr(proxy.address),
+	})
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := client.DialContext(ctx, M.ParseSocksaddrHostPort("127.0.0.1", 443))
+	require.NoError(t, err)
+	payload := make([]byte, 4*1024)
+	_, err = rand.Read(payload)
+	require.NoError(t, err)
+	_, err = conn.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(10*time.Second)))
+	received := make([]byte, len(payload))
+	_, err = io.ReadFull(conn, received)
+	require.NoError(t, err)
+	require.Equal(t, payload, received)
+	<-handler.readStarted
+	<-handler.closeDone
+	time.Sleep(100 * time.Millisecond)
+	received, err = io.ReadAll(conn)
+	require.NoError(t, err)
+	require.Empty(t, received)
+	require.NoError(t, N.CloseWrite(conn))
+	require.NoError(t, conn.Close())
+	time.Sleep(100 * time.Millisecond)
+
+	reuseScenario{client: client, destination: M.ParseSocksaddrHostPort("127.0.0.1", 443)}.RoundTrip(t, "v5-reuse-after-active-server-read")
+	require.Equal(t, int32(1), proxy.count.Load())
+}
+
+func TestV5ServerReuseRejectsWritesAfterCloseWrite(t *testing.T) {
+	handler := &closeThenWriteHandler{
+		results: make(chan closeThenWriteResult, 1),
+	}
+	service, err := snellv5.NewService(snellv5.ServiceOptions{
+		PSK:     []byte(testPSK),
+		Handler: handler,
+	})
+	require.NoError(t, err)
+	serviceAddress := startLocalSnellService(t, service)
+	var proxy countingTCPProxy
+	proxy.Start(t, serviceAddress)
+	client, err := snellv4.NewClient(snellv4.ClientOptions{
+		PSK:    []byte(testPSK),
+		Reuse:  true,
+		Dialer: N.SystemDialer,
+		Server: M.ParseSocksaddr(proxy.address),
+	})
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := client.DialContext(ctx, M.ParseSocksaddrHostPort("127.0.0.1", 443))
+	require.NoError(t, err)
+	result := <-handler.results
+	require.NoError(t, result.responseErr)
+	require.NoError(t, result.closeWriteErr)
+	require.ErrorIs(t, result.writeErr, net.ErrClosed)
+	require.True(t, result.vectorisedCreated)
+	require.ErrorIs(t, result.vectorisedErr, net.ErrClosed)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(10*time.Second)))
+	response, err := io.ReadAll(conn)
+	require.NoError(t, err)
+	require.Equal(t, []byte("response"), response)
+	require.NoError(t, N.CloseWrite(conn))
+	require.NoError(t, conn.Close())
+	time.Sleep(100 * time.Millisecond)
+
+	reuseScenario{client: client, destination: M.ParseSocksaddrHostPort("127.0.0.1", 443)}.RoundTrip(t, "v5-reuse-after-rejected-late-write")
+	require.Equal(t, int32(1), proxy.count.Load())
+}
+
 type localEchoHandler struct{}
 
 func (localEchoHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
@@ -154,6 +272,117 @@ func (localEchoHandler) NewConnectionEx(ctx context.Context, conn net.Conn, sour
 		_, err = io.Copy(conn, bytes.NewReader(payload))
 		if err != nil {
 			closeErr = err
+		}
+	}()
+}
+
+type partialEchoHandler struct {
+	localEchoHandler
+	echoLen int
+}
+
+type closeWhileReadActiveHandler struct {
+	localEchoHandler
+	connectionCount atomic.Int32
+	readStarted     chan struct{}
+	closeDone       chan struct{}
+}
+
+type closeThenWriteResult struct {
+	responseErr       error
+	closeWriteErr     error
+	writeErr          error
+	vectorisedCreated bool
+	vectorisedErr     error
+}
+
+type closeThenWriteHandler struct {
+	localEchoHandler
+	connectionCount atomic.Int32
+	results         chan closeThenWriteResult
+}
+
+func (h *closeThenWriteHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	if h.connectionCount.Add(1) > 1 {
+		h.localEchoHandler.NewConnectionEx(ctx, conn, source, destination, onClose)
+		return
+	}
+	go func() {
+		_, responseErr := conn.Write([]byte("response"))
+		closeWriteErr := N.CloseWrite(conn)
+		_, writeErr := conn.Write([]byte("late-write"))
+		vectorisedWriter, created := bufio.CreateVectorisedWriter(conn)
+		var vectorisedErr error
+		if created {
+			latePayload := []byte("late-vectorised-write")
+			lateBuffer := buf.NewSize(N.CalculateFrontHeadroom(conn) + len(latePayload) + N.CalculateRearHeadroom(conn))
+			lateBuffer.Resize(N.CalculateFrontHeadroom(conn), 0)
+			_, _ = lateBuffer.Write(latePayload)
+			vectorisedErr = vectorisedWriter.WriteVectorised([]*buf.Buffer{lateBuffer})
+		}
+		h.results <- closeThenWriteResult{
+			responseErr:       responseErr,
+			closeWriteErr:     closeWriteErr,
+			writeErr:          writeErr,
+			vectorisedCreated: created,
+			vectorisedErr:     vectorisedErr,
+		}
+		if onClose != nil {
+			onClose(nil)
+		}
+	}()
+}
+
+func (h *closeWhileReadActiveHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	if h.connectionCount.Add(1) > 1 {
+		h.localEchoHandler.NewConnectionEx(ctx, conn, source, destination, onClose)
+		return
+	}
+	go func() {
+		payload := make([]byte, 4*1024)
+		_, err := io.ReadFull(conn, payload)
+		if err == nil {
+			_, err = conn.Write(payload)
+		}
+		if err != nil {
+			if onClose != nil {
+				onClose(err)
+			}
+			return
+		}
+		readDone := make(chan error, 1)
+		go func() {
+			close(h.readStarted)
+			var one [1]byte
+			_, readErr := conn.Read(one[:])
+			readDone <- readErr
+		}()
+		time.Sleep(100 * time.Millisecond)
+		err = conn.Close()
+		close(h.closeDone)
+		readErr := <-readDone
+		if err == nil {
+			err = readErr
+		}
+		if onClose != nil {
+			onClose(err)
+		}
+	}()
+}
+
+func (h partialEchoHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	go func() {
+		payload := make([]byte, h.echoLen)
+		_, err := io.ReadFull(conn, payload)
+		if err == nil {
+			_, err = conn.Write(payload)
+		}
+		closeErr := conn.Close()
+		if err == nil {
+			err = closeErr
+		}
+		if onClose != nil {
+			onClose(err)
 		}
 	}()
 }

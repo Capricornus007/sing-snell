@@ -280,6 +280,37 @@ func TestV6ServerAcceptsV6ClientLoopback(t *testing.T) {
 	}
 }
 
+func TestV6ServerReuseHandlerCloseBeforeClientEOF(t *testing.T) {
+	for name, mode := range v6Modes {
+		t.Run(name, func(t *testing.T) {
+			service, err := snellv6.NewService(snellv6.ServerOptions{
+				PSK:     []byte(testPSK),
+				Mode:    mode,
+				Handler: partialEchoHandler{echoLen: 4 * 1024},
+			})
+			require.NoError(t, err)
+			serviceAddress := startLocalSnellService(t, service)
+			var proxy countingTCPProxy
+			proxy.Start(t, serviceAddress)
+
+			client, err := snellv6.NewClient(snellv6.ClientOptions{
+				PSK:    []byte(testPSK),
+				Mode:   mode,
+				Reuse:  true,
+				Dialer: N.SystemDialer,
+				Server: M.ParseSocksaddr(proxy.address),
+			})
+			require.NoError(t, err)
+			defer client.Close()
+
+			scenario := reuseScenario{client: client, destination: M.ParseSocksaddrHostPort("127.0.0.1", 443)}
+			scenario.PartialEchoRoundTrip(t, "v6-server-drain-1-"+name, 8*1024, 4*1024)
+			scenario.PartialEchoRoundTrip(t, "v6-server-drain-2-"+name, 8*1024, 4*1024)
+			require.Equal(t, int32(1), proxy.count.Load())
+		})
+	}
+}
+
 func TestV6UDP(t *testing.T) {
 	for name, mode := range v6Modes {
 		t.Run(name, func(t *testing.T) {

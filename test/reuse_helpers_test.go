@@ -163,6 +163,25 @@ func (s reuseScenario) RoundTrip(t *testing.T, label string) {
 	require.NoError(t, conn.Close())
 }
 
+func (s reuseScenario) PartialEchoRoundTrip(t *testing.T, label string, payloadLen int, echoLen int) {
+	payload := make([]byte, payloadLen)
+	_, err := rand.Read(payload)
+	require.NoError(t, err)
+	copy(payload, []byte(label))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := s.client.DialContext(ctx, s.destination)
+	require.NoError(t, err)
+	_, err = conn.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, N.CloseWrite(conn))
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(10*time.Second)))
+	received, err := io.ReadAll(conn)
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(payload[:echoLen], received), "%s payload mismatch", label)
+	require.NoError(t, conn.Close())
+}
+
 func (s reuseScenario) CloseBeforeServerEOF(t *testing.T, label string, waitAfterClose time.Duration) {
 	payload := make([]byte, 4*1024)
 	_, err := rand.Read(payload)

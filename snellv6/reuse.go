@@ -523,25 +523,52 @@ func (s *serverReuseSession[U]) Serve(ctx context.Context, source M.Socksaddr, o
 			s.Conn.Close()
 			return E.Extend(snell.ErrUnsupportedCommand, request.Command)
 		}
-		serverConn := &serverReuseConn[U]{Conn: s.Conn, session: s, completion: make(chan error, 1)}
+		serverConn := &serverReuseConn[U]{Conn: s.Conn, session: s, completion: make(chan struct{})}
 		if record.IsEmpty() {
 			record.Release()
 		} else {
 			s.reader.SetCache(record)
 		}
 		s.service.handler.NewConnectionEx(requestCtx, serverConn, source, request.Destination, serverConn.completeLogicalConnection)
-		err = serverConn.waitLogicalConnection(requestCtx)
-		if err != nil {
+		select {
+		case <-serverConn.completion:
+		case <-requestCtx.Done():
 			s.Conn.Close()
-			return err
+			return requestCtx.Err()
 		}
-		err = serverConn.Finish()
+		err = serverConn.CloseWrite()
 		if err != nil {
 			s.Conn.Close()
 			return err
 		}
 		if serverConn.aborted.Load() {
 			return nil
+		}
+		if !serverConn.readClosed.Load() {
+			// snell-server v6.0.0b4: after writing the EOF packet, FUN_00141bc0 keeps
+			// consuming client records (forwarding them into the still writable
+			// outgoing socket) until the zero chunk reaches FUN_001419e0 ->
+			// FUN_001402c0 -> FUN_001401b0, which resets the tunnel stage so the
+			// next record is parsed as a request. The handler has already released
+			// the upstream, so discard instead, capped like the client waiting state.
+			var discarded int
+			for {
+				var drainRecord *buf.Buffer
+				drainRecord, err = s.reader.NextRecord()
+				if err != nil {
+					break
+				}
+				discarded += drainRecord.Len()
+				drainRecord.Release()
+				if discarded >= reuse.WaitingDiscardLimit {
+					s.Conn.Close()
+					return E.New("snell: read too much data after request end")
+				}
+			}
+			if !errors.Is(err, io.EOF) {
+				s.Conn.Close()
+				return E.Cause(err, "drain request")
+			}
 		}
 		record, err = s.reader.ReadRecord()
 		if err != nil {
@@ -572,8 +599,9 @@ type serverReuseConn[U comparable] struct {
 	readClosed     atomic.Bool
 	aborted        atomic.Bool
 	replyWritten   bool
+	writeClosed    bool
 	completeOnce   sync.Once
-	completion     chan error
+	completion     chan struct{}
 }
 
 func (c *serverReuseConn[U]) writeResponse(payload []byte) error {
@@ -661,6 +689,9 @@ func (c *serverReuseConn[U]) ReadBuffer(buffer *buf.Buffer) error {
 func (c *serverReuseConn[U]) Write(p []byte) (int, error) {
 	c.access.Lock()
 	defer c.access.Unlock()
+	if c.writeClosed {
+		return 0, net.ErrClosed
+	}
 	if c.replyWritten {
 		return c.session.writer.Write(p)
 	}
@@ -674,6 +705,10 @@ func (c *serverReuseConn[U]) Write(p []byte) (int, error) {
 func (c *serverReuseConn[U]) WriteBuffer(buffer *buf.Buffer) error {
 	c.access.Lock()
 	defer c.access.Unlock()
+	if c.writeClosed {
+		buffer.Release()
+		return net.ErrClosed
+	}
 	if c.replyWritten {
 		return c.session.writer.WriteBuffer(buffer)
 	}
@@ -696,10 +731,13 @@ type serverReuseVectorisedWriter[U comparable] struct {
 func (w *serverReuseVectorisedWriter[U]) WriteVectorised(buffers []*buf.Buffer) error {
 	conn := w.conn
 	conn.access.Lock()
+	defer conn.access.Unlock()
+	if conn.writeClosed {
+		buf.ReleaseMulti(buffers)
+		return net.ErrClosed
+	}
 	if conn.replyWritten {
-		recordWriter := conn.session.writer
-		conn.access.Unlock()
-		return recordWriter.CreateVectorisedWriterFor(w.upstream).WriteVectorised(buffers)
+		return conn.session.writer.CreateVectorisedWriterFor(w.upstream).WriteVectorised(buffers)
 	}
 	for index, buffer := range buffers {
 		if buffer.IsEmpty() {
@@ -708,19 +746,14 @@ func (w *serverReuseVectorisedWriter[U]) WriteVectorised(buffers []*buf.Buffer) 
 		}
 		err := conn.writeResponseBuffer(buffer)
 		if err != nil {
-			conn.access.Unlock()
 			buf.ReleaseMulti(buffers[index+1:])
 			return err
 		}
 		if index+1 < len(buffers) {
-			recordWriter := conn.session.writer
-			conn.access.Unlock()
-			return recordWriter.CreateVectorisedWriterFor(w.upstream).WriteVectorised(buffers[index+1:])
+			return conn.session.writer.CreateVectorisedWriterFor(w.upstream).WriteVectorised(buffers[index+1:])
 		}
-		conn.access.Unlock()
 		return nil
 	}
-	conn.access.Unlock()
 	return nil
 }
 
@@ -728,6 +761,7 @@ func (c *serverReuseConn[U]) CloseWrite() error {
 	c.closeWriteOnce.Do(func() {
 		c.access.Lock()
 		defer c.access.Unlock()
+		c.writeClosed = true
 		// snell-server v6.0.0b4: FUN_001414e0 -> FUN_00140390 reports upstream EOF
 		// before any payload as ReplyError 0x65 "Remote EOF", marks the context
 		// aborted, and FUN_00141390 closes the tunnel after the error data is written.
@@ -746,42 +780,17 @@ func (c *serverReuseConn[U]) CloseWrite() error {
 
 func (c *serverReuseConn[U]) Close() error {
 	c.closeOnce.Do(func() {
+		// The handler may close this side while its peer copy is still reading.
+		// onClose owns completion and runs only after both copy directions exit.
 		c.closeErr = c.CloseWrite()
-		c.completeLogicalConnection(c.closeErr)
 	})
 	return c.closeErr
 }
 
-func (c *serverReuseConn[U]) Finish() error {
-	err := c.CloseWrite()
-	if err != nil {
-		return err
-	}
-	if c.aborted.Load() {
-		return nil
-	}
-	// snell-server v6.0.0b4: FUN_00141bc0 reads the next request only after the
-	// previous logical request has ended with client EOF.
-	if !c.readClosed.Load() {
-		return E.New("snell: reusable request ended before client EOF")
-	}
-	return nil
-}
-
-func (c *serverReuseConn[U]) completeLogicalConnection(err error) {
+func (c *serverReuseConn[U]) completeLogicalConnection(error) {
 	c.completeOnce.Do(func() {
-		c.completion <- err
 		close(c.completion)
 	})
-}
-
-func (c *serverReuseConn[U]) waitLogicalConnection(ctx context.Context) error {
-	select {
-	case err := <-c.completion:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
 }
 
 func (c *serverReuseConn[U]) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
