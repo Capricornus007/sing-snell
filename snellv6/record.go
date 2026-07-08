@@ -299,7 +299,9 @@ type vectorisedUnshapedWriter struct {
 
 func (w *vectorisedUnshapedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	var records []*buf.Buffer
-	defer buf.ReleaseMulti(records)
+	defer func() {
+		buf.ReleaseMulti(records)
+	}()
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()
@@ -343,7 +345,9 @@ type packetVectorisedUnshapedWriter struct {
 
 func (w *packetVectorisedUnshapedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	var records []*buf.Buffer
-	defer buf.ReleaseMulti(records)
+	defer func() {
+		buf.ReleaseMulti(records)
+	}()
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()
@@ -522,7 +526,9 @@ type vectorisedRawWriter struct {
 
 func (w *vectorisedRawWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	var records []*buf.Buffer
-	defer buf.ReleaseMulti(records)
+	defer func() {
+		buf.ReleaseMulti(records)
+	}()
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()
@@ -566,7 +572,9 @@ type packetVectorisedRawWriter struct {
 
 func (w *packetVectorisedRawWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	var records []*buf.Buffer
-	defer buf.ReleaseMulti(records)
+	defer func() {
+		buf.ReleaseMulti(records)
+	}()
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()

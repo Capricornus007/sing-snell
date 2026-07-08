@@ -586,7 +586,9 @@ type vectorisedWriter struct {
 
 func (w *vectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	var records []*buf.Buffer
-	defer buf.ReleaseMulti(records)
+	defer func() {
+		buf.ReleaseMulti(records)
+	}()
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()
@@ -642,7 +644,9 @@ type packetVectorisedWriter struct {
 
 func (w *packetVectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	var records []*buf.Buffer
-	defer buf.ReleaseMulti(records)
+	defer func() {
+		buf.ReleaseMulti(records)
+	}()
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()

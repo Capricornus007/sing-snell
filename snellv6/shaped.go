@@ -155,7 +155,9 @@ func (w *shapedWriter) Write(p []byte) (n int, err error) {
 	now := time.Now()
 	originalLen := len(p)
 	var records []*buf.Buffer
-	defer buf.ReleaseMulti(records)
+	defer func() {
+		buf.ReleaseMulti(records)
+	}()
 	for len(p) > 0 {
 		payloadLimit := w.payloadLimitFor(now)
 		recordLen := min(len(p), payloadLimit)
@@ -189,7 +191,9 @@ func (w *shapedWriter) WriteBuffer(buffer *buf.Buffer) error {
 		return err
 	}
 	var records []*buf.Buffer
-	defer buf.ReleaseMulti(records)
+	defer func() {
+		buf.ReleaseMulti(records)
+	}()
 	for data := buffer.Bytes(); len(data) > 0; {
 		recordLen := min(len(data), payloadLimit)
 		records = append(records, w.makeSliceRecord(data[:recordLen]))
@@ -263,7 +267,9 @@ type vectorisedShapedWriter struct {
 
 func (w *vectorisedShapedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	var records []*buf.Buffer
-	defer buf.ReleaseMulti(records)
+	defer func() {
+		buf.ReleaseMulti(records)
+	}()
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()
@@ -310,7 +316,9 @@ type packetVectorisedShapedWriter struct {
 
 func (w *packetVectorisedShapedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	var records []*buf.Buffer
-	defer buf.ReleaseMulti(records)
+	defer func() {
+		buf.ReleaseMulti(records)
+	}()
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()
