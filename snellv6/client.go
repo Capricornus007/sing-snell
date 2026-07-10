@@ -3,6 +3,7 @@ package snellv6
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 
 	snell "github.com/sagernet/sing-snell"
 	"github.com/sagernet/sing-snell/internal/reuse"
@@ -86,8 +87,11 @@ type clientConn struct {
 	destination M.Socksaddr
 
 	access          sync.Mutex
+	readAccess      sync.Mutex
 	reader          reuse.RecordReader
 	writer          reuse.RecordWriter
+	readerReady     atomic.Bool
+	writerReady     atomic.Bool
 	readWaitOptions N.ReadWaitOptions
 	closeWriteOnce  sync.Once
 	closeWriteErr   error
@@ -131,6 +135,7 @@ func (c *clientConn) writeRequest(payload []byte) error {
 			return E.Cause(err, "write request")
 		}
 	}
+	c.writerReady.Store(true)
 	return nil
 }
 
@@ -147,12 +152,16 @@ func (c *clientConn) writeRequestBuffer(buffer *buf.Buffer) error {
 		return E.Cause(err, "write request")
 	}
 	c.writer = writer
+	c.writerReady.Store(true)
 	return nil
 }
 
-func (c *clientConn) readResponse() error {
+func (c *clientConn) readResponseLocked() error {
 	if c.reader != nil {
 		return nil
+	}
+	if err := c.ensureRequest(); err != nil {
+		return err
 	}
 	reader, record, err := readFirstRecord(c.Conn, c.client.mode, c.client.psk, c.client.profile, c.readWaitOptions)
 	if err != nil {
@@ -164,11 +173,23 @@ func (c *clientConn) readResponse() error {
 	}
 	reader.SetCache(cached)
 	c.reader = reader
+	c.readerReady.Store(true)
 	return nil
 }
 
+func (c *clientConn) ensureRequest() error {
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.writer != nil {
+		return nil
+	}
+	return c.writeRequest(nil)
+}
+
 func (c *clientConn) Read(p []byte) (int, error) {
-	err := c.readResponse()
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
+	err := c.readResponseLocked()
 	if err != nil {
 		return 0, err
 	}
@@ -176,7 +197,9 @@ func (c *clientConn) Read(p []byte) (int, error) {
 }
 
 func (c *clientConn) ReadBuffer(buffer *buf.Buffer) error {
-	err := c.readResponse()
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
+	err := c.readResponseLocked()
 	if err != nil {
 		return err
 	}
@@ -184,13 +207,14 @@ func (c *clientConn) ReadBuffer(buffer *buf.Buffer) error {
 }
 
 func (c *clientConn) Write(p []byte) (int, error) {
-	if c.writer != nil {
-		return c.writer.Write(p)
+	if len(p) == 0 {
+		return 0, c.ensureRequest()
 	}
 	c.access.Lock()
 	if c.writer != nil {
+		writer := c.writer
 		c.access.Unlock()
-		return c.writer.Write(p)
+		return writer.Write(p)
 	}
 	defer c.access.Unlock()
 	err := c.writeRequest(p)
@@ -201,13 +225,11 @@ func (c *clientConn) Write(p []byte) (int, error) {
 }
 
 func (c *clientConn) WriteBuffer(buffer *buf.Buffer) error {
-	if c.writer != nil {
-		return c.writer.WriteBuffer(buffer)
-	}
 	c.access.Lock()
 	if c.writer != nil {
+		writer := c.writer
 		c.access.Unlock()
-		return c.writer.WriteBuffer(buffer)
+		return writer.WriteBuffer(buffer)
 	}
 	defer c.access.Unlock()
 	return c.writeRequestBuffer(buffer)
@@ -228,9 +250,6 @@ type clientVectorisedWriter struct {
 
 func (w *clientVectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	conn := w.conn
-	if conn.writer != nil {
-		return conn.writer.CreateVectorisedWriterFor(w.upstream).WriteVectorised(buffers)
-	}
 	conn.access.Lock()
 	if conn.writer != nil {
 		recordWriter := conn.writer
@@ -276,6 +295,8 @@ func (c *clientConn) CloseWrite() error {
 }
 
 func (c *clientConn) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy bool) {
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
 	c.readWaitOptions = options
 	if c.reader != nil {
 		c.reader.InitializeReadWaiter(options)
@@ -284,7 +305,9 @@ func (c *clientConn) InitializeReadWaiter(options N.ReadWaitOptions) (needCopy b
 }
 
 func (c *clientConn) WaitReadBuffer() (*buf.Buffer, error) {
-	err := c.readResponse()
+	c.readAccess.Lock()
+	defer c.readAccess.Unlock()
+	err := c.readResponseLocked()
 	if err != nil {
 		return nil, err
 	}
@@ -296,9 +319,6 @@ func (c *clientConn) CreateReadWaiter() (N.ReadWaiter, bool) {
 }
 
 func (c *clientConn) FrontHeadroom() int {
-	if c.writer != nil {
-		return c.writer.FrontHeadroom()
-	}
 	requestPayload := snell.Request{Command: snell.CommandConnectV2, ClientID: c.client.userKey, Destination: c.destination}
 	switch c.client.mode {
 	case ModeUnsafeRaw:
@@ -311,9 +331,6 @@ func (c *clientConn) FrontHeadroom() int {
 }
 
 func (c *clientConn) RearHeadroom() int {
-	if c.writer != nil {
-		return c.writer.RearHeadroom()
-	}
 	if c.client.mode == ModeUnsafeRaw {
 		return 0
 	}
@@ -321,9 +338,6 @@ func (c *clientConn) RearHeadroom() int {
 }
 
 func (c *clientConn) WriterMTU() int {
-	if c.writer != nil {
-		return c.writer.WriterMTU()
-	}
 	if c.client.mode == ModeDefault {
 		return c.client.profile.chunkMax
 	}
@@ -331,15 +345,15 @@ func (c *clientConn) WriterMTU() int {
 }
 
 func (c *clientConn) NeedHandshakeForRead() bool {
-	return c.reader == nil
+	return !c.readerReady.Load()
 }
 
 func (c *clientConn) NeedHandshakeForWrite() bool {
-	return c.writer == nil
+	return !c.writerReady.Load()
 }
 
 func (c *clientConn) NeedAdditionalReadDeadline() bool {
-	return c.reader == nil
+	return !c.readerReady.Load()
 }
 
 func (c *clientConn) Upstream() any {
