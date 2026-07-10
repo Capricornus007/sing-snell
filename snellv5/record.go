@@ -32,6 +32,11 @@ const (
 	maxInitialPaddingLen      = initialPaddingMin + initialPaddingSpan - 1
 	framePayloadStep          = frameSize - resetRecordOverhead
 	framePayloadResetInterval = 31
+	// snell-server v5.0.1: FUN_0013a700 caps a stream read at four times
+	// libuv 1.48.0's 64 KiB suggestion, while actual callbacks are commonly
+	// partial. A three-suggestion pacing window matches the observed growth
+	// envelope without coupling it to sing's much smaller Go copy buffers.
+	streamPayloadBatchSize = 3 * 64 * 1024
 )
 
 type reader struct {
@@ -209,6 +214,8 @@ type writer struct {
 	access            sync.Mutex
 	lastFrameUnix     int64
 	framePayloadLen   int
+	streamPayloadLen  int
+	streamPayloadLeft int
 	initialPaddingLen int
 }
 
@@ -261,6 +268,22 @@ func (w *writer) markPayloadLimitUsed(payloadLimit int) {
 	}
 }
 
+func (w *writer) nextStreamPayloadBatch(dataLen int) (payloadLimit int, batchLen int) {
+	now := time.Now().Unix()
+	if w.streamPayloadLeft == 0 || w.lastFrameUnix != 0 && now-w.lastFrameUnix >= framePayloadResetInterval {
+		w.streamPayloadLen = w.nextPayloadLimit()
+		w.streamPayloadLeft = streamPayloadBatchSize
+	} else {
+		// The virtual batch can span several Go copy buffers. Keep the 31-second
+		// reset tied to actual stream activity rather than the first buffer only.
+		w.lastFrameUnix = now
+	}
+	payloadLimit = w.streamPayloadLen
+	batchLen = min(dataLen, w.streamPayloadLeft)
+	w.streamPayloadLeft -= batchLen
+	return
+}
+
 func (w *writer) randomInt31() (int, error) {
 	var randomBytes [4]byte
 	_, err := io.ReadFull(rand.Reader, randomBytes[:])
@@ -273,28 +296,29 @@ func (w *writer) randomInt31() (int, error) {
 func (w *writer) Write(p []byte) (n int, err error) {
 	w.access.Lock()
 	defer w.access.Unlock()
-	payloadLimit := w.nextPayloadLimit()
+	if len(p) == 0 {
+		return 0, nil
+	}
 	for len(p) > 0 {
-		var data []byte
-		if len(p) > payloadLimit {
-			data = p[:payloadLimit]
-			p = p[payloadLimit:]
-		} else {
-			data = p
-			p = nil
+		payloadLimit, batchLen := w.nextStreamPayloadBatch(len(p))
+		recordCount := (batchLen + payloadLimit - 1) / payloadLimit
+		output := buf.NewSize(batchLen + recordCount*(snell.HeaderCipherLen+snell.AEADTagLen))
+		for data := p[:batchLen]; len(data) > 0; {
+			recordLen := min(len(data), payloadLimit)
+			recordErr := w.sealRecordLocked(output, data[:recordLen], 0)
+			if recordErr != nil {
+				output.Release()
+				return n, recordErr
+			}
+			data = data[recordLen:]
 		}
-		buffer := buf.NewSize(snell.HeaderCipherLen + len(data) + snell.AEADTagLen)
-		w.sealHeader(buffer.Extend(snell.HeaderCipherLen), 0, len(data))
-		buffer.Write(data)
-		w.cipher.Seal(buffer.From(snell.HeaderCipherLen)[:0], w.nonce, buffer.From(snell.HeaderCipherLen), nil)
-		buffer.Extend(snell.AEADTagLen)
-		snell.IncreaseNonce(w.nonce)
-		_, err = w.upstream.Write(buffer.Bytes())
-		buffer.Release()
+		_, err = w.upstream.Write(output.Bytes())
+		output.Release()
 		if err != nil {
 			return
 		}
-		n += len(data)
+		n += batchLen
+		p = p[batchLen:]
 	}
 	return
 }
@@ -302,10 +326,9 @@ func (w *writer) Write(p []byte) (n int, err error) {
 func (w *writer) WriteFirst(salt []byte, payload []byte) error {
 	w.access.Lock()
 	defer w.access.Unlock()
-	// snell-server v5.0.1: FUN_0013f020 prefixes the response byte and then calls
-	// FUN_00139670 once; that call reuses one payload limit for every emitted chunk.
-	payloadLimit := w.nextPayloadLimit()
 	if len(payload) == 0 {
+		w.streamPayloadLeft = 0
+		w.nextPayloadLimit()
 		record := buf.NewSize(len(salt) + snell.HeaderCipherLen)
 		common.Must1(record.Write(salt))
 		w.sealHeader(record.Extend(snell.HeaderCipherLen), 0, 0)
@@ -315,69 +338,72 @@ func (w *writer) WriteFirst(salt []byte, payload []byte) error {
 	}
 	firstRecord := true
 	for len(payload) > 0 {
-		recordLen := min(len(payload), payloadLimit)
-		saltLen := 0
-		paddingLen := 0
+		payloadLimit, batchLen := w.nextStreamPayloadBatch(len(payload))
+		recordCount := (batchLen + payloadLimit - 1) / payloadLimit
+		outputSize := batchLen + recordCount*(snell.HeaderCipherLen+snell.AEADTagLen)
 		if firstRecord {
-			saltLen = len(salt)
-			paddingLen = w.initialPaddingLen
+			outputSize += len(salt) + w.initialPaddingLen
 		}
-		record := buf.NewSize(saltLen + snell.HeaderCipherLen + paddingLen + recordLen + snell.AEADTagLen)
-		if saltLen > 0 {
-			common.Must1(record.Write(salt))
+		output := buf.NewSize(outputSize)
+		if firstRecord {
+			common.Must1(output.Write(salt))
 		}
-		w.sealHeader(record.Extend(snell.HeaderCipherLen), paddingLen, recordLen)
-		padding := record.Extend(paddingLen)
-		payloadCipher := record.Extend(recordLen + snell.AEADTagLen)
-		copy(payloadCipher, payload[:recordLen])
-		w.cipher.Seal(payloadCipher[:0], w.nonce, payloadCipher[:recordLen], nil)
-		snell.IncreaseNonce(w.nonce)
-		if paddingLen > 0 {
-			err := w.fillPadding(padding, payloadCipher)
+		for data := payload[:batchLen]; len(data) > 0; {
+			recordLen := min(len(data), payloadLimit)
+			paddingLen := 0
+			if firstRecord {
+				paddingLen = w.initialPaddingLen
+			}
+			err := w.sealRecordLocked(output, data[:recordLen], paddingLen)
 			if err != nil {
-				record.Release()
+				output.Release()
 				return err
 			}
-			limit := min(len(padding), len(payloadCipher))
-			for index := 0; index < limit; index += 2 {
-				padding[index], payloadCipher[index] = payloadCipher[index], padding[index]
-			}
+			data = data[recordLen:]
+			firstRecord = false
 		}
-		err := common.Error(w.upstream.Write(record.Bytes()))
-		record.Release()
+		err := common.Error(w.upstream.Write(output.Bytes()))
+		output.Release()
 		if err != nil {
 			return err
 		}
-		payload = payload[recordLen:]
-		firstRecord = false
+		payload = payload[batchLen:]
 	}
 	return nil
 }
 
-func (w *writer) makeSliceRecordLocked(payload []byte, paddingLen int) (*buf.Buffer, error) {
+func (w *writer) sealRecordLocked(output *buf.Buffer, payload []byte, paddingLen int) error {
 	if len(payload) > maxPayload || paddingLen > maxPayload {
 		panic("snell: v5 record exceeds maximum")
 	}
 	if len(payload) == 0 && paddingLen != 0 {
 		panic("snell: zero-length v5 record carries padding")
 	}
-	record := buf.NewSize(snell.HeaderCipherLen + paddingLen + len(payload) + snell.AEADTagLen)
-	w.sealHeader(record.Extend(snell.HeaderCipherLen), paddingLen, len(payload))
-	padding := record.Extend(paddingLen)
-	payloadCipher := record.Extend(len(payload) + snell.AEADTagLen)
+	w.sealHeader(output.Extend(snell.HeaderCipherLen), paddingLen, len(payload))
+	padding := output.Extend(paddingLen)
+	payloadCipher := output.Extend(len(payload) + snell.AEADTagLen)
 	copy(payloadCipher, payload)
 	w.cipher.Seal(payloadCipher[:0], w.nonce, payloadCipher[:len(payload)], nil)
 	snell.IncreaseNonce(w.nonce)
 	if paddingLen > 0 {
 		err := w.fillPadding(padding, payloadCipher)
 		if err != nil {
-			record.Release()
-			return nil, err
+			return err
 		}
 		limit := min(len(padding), len(payloadCipher))
 		for index := 0; index < limit; index += 2 {
 			padding[index], payloadCipher[index] = payloadCipher[index], padding[index]
 		}
+	}
+	return nil
+}
+
+func (w *writer) makeSliceRecordLocked(payload []byte, paddingLen int) (*buf.Buffer, error) {
+	record := buf.NewSize(snell.HeaderCipherLen + paddingLen + len(payload) + snell.AEADTagLen)
+	err := w.sealRecordLocked(record, payload, paddingLen)
+	if err != nil {
+		record.Release()
+		return nil, err
 	}
 	return record, nil
 }
@@ -420,29 +446,35 @@ func (w *writer) WriteBuffer(buffer *buf.Buffer) error {
 	}
 	w.access.Lock()
 	defer w.access.Unlock()
-	payloadLimit := w.nextPayloadLimit()
-	if dataLen > payloadLimit {
-		for data := buffer.Bytes(); len(data) > 0; {
-			recordLen := min(len(data), payloadLimit)
-			record, err := w.makeSliceRecordLocked(data[:recordLen], 0)
+	for data := buffer.Bytes(); len(data) > 0; {
+		payloadLimit, batchLen := w.nextStreamPayloadBatch(len(data))
+		if len(data) == dataLen && batchLen == dataLen && dataLen <= payloadLimit {
+			record, err := w.makeBufferRecordLocked(buffer, 0)
 			if err != nil {
 				return err
 			}
-			err = common.Error(w.upstream.Write(record.Bytes()))
-			record.Release()
-			if err != nil {
-				return err
-			}
-			data = data[recordLen:]
+			defer record.Release()
+			return common.Error(w.upstream.Write(record.Bytes()))
 		}
-		return nil
+		recordCount := (batchLen + payloadLimit - 1) / payloadLimit
+		output := buf.NewSize(batchLen + recordCount*(snell.HeaderCipherLen+snell.AEADTagLen))
+		for batch := data[:batchLen]; len(batch) > 0; {
+			recordLen := min(len(batch), payloadLimit)
+			err := w.sealRecordLocked(output, batch[:recordLen], 0)
+			if err != nil {
+				output.Release()
+				return err
+			}
+			batch = batch[recordLen:]
+		}
+		err := common.Error(w.upstream.Write(output.Bytes()))
+		output.Release()
+		if err != nil {
+			return err
+		}
+		data = data[batchLen:]
 	}
-	record, err := w.makeBufferRecordLocked(buffer, 0)
-	if err != nil {
-		return err
-	}
-	defer record.Release()
-	return common.Error(w.upstream.Write(record.Bytes()))
+	return nil
 }
 
 func (w *writer) WritePacketBuffer(buffer *buf.Buffer) error {
@@ -465,6 +497,7 @@ func (w *writer) WritePacketBuffer(buffer *buf.Buffer) error {
 		buffer.Release()
 		return snell.ErrPayloadTooLarge
 	}
+	w.streamPayloadLeft = 0
 	w.lastFrameUnix = now
 	w.markPayloadLimitUsed(payloadLimit)
 	record, err := w.makeBufferRecordLocked(buffer, 0)
@@ -482,6 +515,7 @@ func (w *writer) WriteZeroChunk() error {
 	defer w.access.Unlock()
 	// snell-server v5.0.1: FUN_0013def0 calls FUN_00139670 even for an empty
 	// payload, so EOF records consume one growth-window step.
+	w.streamPayloadLeft = 0
 	w.nextPayloadLimit()
 	w.sealHeader(buffer.Extend(snell.HeaderCipherLen), 0, 0)
 	err := common.Error(w.upstream.Write(buffer.Bytes()))
@@ -592,7 +626,6 @@ func (w *vectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()
-	payloadLimit := recordWriter.nextPayloadLimit()
 	for index, buffer := range buffers {
 		dataLen := buffer.Len()
 		if dataLen == 0 {
@@ -600,7 +633,8 @@ func (w *vectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 			continue
 		}
 		for data := buffer.Bytes(); len(data) > 0; {
-			if len(data) == dataLen && dataLen <= payloadLimit {
+			payloadLimit, batchLen := recordWriter.nextStreamPayloadBatch(len(data))
+			if len(data) == dataLen && batchLen == dataLen && dataLen <= payloadLimit {
 				record, err := recordWriter.makeBufferRecordLocked(buffer, 0)
 				if err != nil {
 					buffer.Release()
@@ -611,15 +645,18 @@ func (w *vectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 				records = append(records, record)
 				break
 			}
-			recordLen := min(len(data), payloadLimit)
-			record, err := recordWriter.makeSliceRecordLocked(data[:recordLen], 0)
-			if err != nil {
-				buffer.Release()
-				buf.ReleaseMulti(buffers[index+1:])
-				return err
+			for batch := data[:batchLen]; len(batch) > 0; {
+				recordLen := min(len(batch), payloadLimit)
+				record, err := recordWriter.makeSliceRecordLocked(batch[:recordLen], 0)
+				if err != nil {
+					buffer.Release()
+					buf.ReleaseMulti(buffers[index+1:])
+					return err
+				}
+				records = append(records, record)
+				batch = batch[recordLen:]
 			}
-			records = append(records, record)
-			data = data[recordLen:]
+			data = data[batchLen:]
 		}
 		if buffer != nil {
 			buffer.Release()
@@ -673,6 +710,7 @@ func (w *packetVectorisedWriter) WriteVectorised(buffers []*buf.Buffer) error {
 			buf.ReleaseMulti(buffers[index+1:])
 			return snell.ErrPayloadTooLarge
 		}
+		recordWriter.streamPayloadLeft = 0
 		recordWriter.lastFrameUnix = now
 		recordWriter.markPayloadLimitUsed(payloadLimit)
 		record, err := recordWriter.makeBufferRecordLocked(buffer, 0)

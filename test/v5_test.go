@@ -2,6 +2,7 @@ package test
 
 import (
 	"bytes"
+	"context"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +28,129 @@ import (
 const testPSK = "snell-interop-test-psk-0123456789"
 
 var errV5RawZeroChunk = errors.New("snell v5 raw zero chunk")
+
+type recordingConn struct {
+	net.Conn
+	access    sync.Mutex
+	readBytes []byte
+}
+
+type payloadGrowthMetrics struct {
+	foundMaxPayload       bool
+	firstMaxPayloadOffset int
+	payloadBytes          int
+	maxPayloadBefore1MiB  int
+	recordCount           int
+}
+
+func (c *recordingConn) Read(p []byte) (n int, err error) {
+	n, err = c.Conn.Read(p)
+	if n > 0 {
+		c.access.Lock()
+		c.readBytes = append(c.readBytes, p[:n]...)
+		c.access.Unlock()
+	}
+	return
+}
+
+func (c *recordingConn) PayloadGrowthMetrics(t *testing.T) payloadGrowthMetrics {
+	c.access.Lock()
+	wire := append([]byte(nil), c.readBytes...)
+	c.access.Unlock()
+	require.GreaterOrEqual(t, len(wire), snell.SaltLen)
+	responseAEAD, err := snell.NewAEAD(snell.DeriveKey([]byte(testPSK), wire[:snell.SaltLen]))
+	require.NoError(t, err)
+	responseNonce := make([]byte, snell.NonceLen)
+	offset := snell.SaltLen
+	var metrics payloadGrowthMetrics
+	for offset+snell.HeaderCipherLen <= len(wire) {
+		responseHeader, openErr := responseAEAD.Open(nil, responseNonce, wire[offset:offset+snell.HeaderCipherLen], nil)
+		require.NoError(t, openErr)
+		snell.IncreaseNonce(responseNonce)
+		paddingLen := int(binary.BigEndian.Uint16(responseHeader[3:5]))
+		payloadLen := int(binary.BigEndian.Uint16(responseHeader[5:7]))
+		if payloadLen == snell.MaxPayloadLen && !metrics.foundMaxPayload {
+			metrics.foundMaxPayload = true
+			metrics.firstMaxPayloadOffset = metrics.payloadBytes
+		}
+		if metrics.payloadBytes < 1024*1024 {
+			metrics.maxPayloadBefore1MiB = max(metrics.maxPayloadBefore1MiB, payloadLen)
+		}
+		offset += snell.HeaderCipherLen
+		if payloadLen == 0 {
+			break
+		}
+		require.LessOrEqual(t, offset+paddingLen+payloadLen+snell.AEADTagLen, len(wire))
+		padding := append([]byte(nil), wire[offset:offset+paddingLen]...)
+		offset += paddingLen
+		payloadCipher := append([]byte(nil), wire[offset:offset+payloadLen+snell.AEADTagLen]...)
+		offset += payloadLen + snell.AEADTagLen
+		mixLimit := min(len(padding), len(payloadCipher))
+		for index := 0; index < mixLimit; index += 2 {
+			padding[index], payloadCipher[index] = payloadCipher[index], padding[index]
+		}
+		_, openErr = responseAEAD.Open(payloadCipher[:0], responseNonce, payloadCipher, nil)
+		require.NoError(t, openErr)
+		snell.IncreaseNonce(responseNonce)
+		metrics.payloadBytes += payloadLen
+		metrics.recordCount++
+	}
+	return metrics
+}
+
+type continuousDownloadTarget struct {
+	payload []byte
+	release <-chan struct{}
+}
+
+func (s continuousDownloadTarget) Start(t *testing.T) uint16 {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { listener.Close() })
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				var trigger [1]byte
+				_, readErr := io.ReadFull(conn, trigger[:])
+				if readErr != nil {
+					return
+				}
+				_, writeErr := io.Copy(conn, bytes.NewReader(s.payload))
+				if writeErr != nil {
+					return
+				}
+				<-s.release
+			}()
+		}
+	}()
+	return uint16(listener.Addr().(*net.TCPAddr).Port)
+}
+
+type localRouteHandler struct{}
+
+func (localRouteHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	go func() {
+		upstream, err := net.Dial("tcp", destination.String())
+		if err == nil {
+			err = bufio.CopyConn(ctx, conn, upstream)
+		}
+		if onClose != nil {
+			onClose(err)
+		}
+	}()
+}
+
+func (localRouteHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	err := conn.Close()
+	if onClose != nil {
+		onClose(err)
+	}
+}
 
 func v5Config(psk string, port uint16) string {
 	return fmt.Sprintf("[snell-server]\nlisten = 0.0.0.0:%d\npsk = %s\nipv6 = false\n", port, psk)
@@ -129,6 +254,67 @@ func TestV5FirstResponseRecordShape(t *testing.T) {
 			require.NoError(subTest, err)
 			expectedPayload := append([]byte{snell.ReplyTunnel}, earlyPayload...)
 			require.Equal(subTest, expectedPayload, responsePayload)
+		})
+	}
+}
+
+func TestV5ServerPayloadGrowthUnderContinuousDownload(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x5a}, 4*1024*1024)
+	releaseTarget := make(chan struct{})
+	t.Cleanup(func() { close(releaseTarget) })
+	targetPort := continuousDownloadTarget{payload: payload, release: releaseTarget}.Start(t)
+	for _, testCase := range []struct {
+		name     string
+		official bool
+	}{
+		{name: "official-v5.0.1", official: true},
+		{name: "local-v5"},
+	} {
+		t.Run(testCase.name, func(subTest *testing.T) {
+			var serverAddress string
+			if testCase.official {
+				port := freePort(subTest)
+				startSnellServer(subTest, "v5", v5Config(testPSK, port), port)
+				serverAddress = fmt.Sprintf("127.0.0.1:%d", port)
+			} else {
+				service, err := snellv5.NewService(snellv5.ServiceOptions{
+					PSK:     []byte(testPSK),
+					Handler: localRouteHandler{},
+				})
+				require.NoError(subTest, err)
+				serverAddress = startLocalSnellService(subTest, service)
+			}
+
+			serverConn, err := net.Dial("tcp", serverAddress)
+			require.NoError(subTest, err)
+			recordingServerConn := &recordingConn{Conn: serverConn}
+			defer recordingServerConn.Close()
+			client, err := snellv4.NewClient(snellv4.ClientOptions{PSK: []byte(testPSK)})
+			require.NoError(subTest, err)
+			proxyConn, err := client.DialConn(recordingServerConn, M.ParseSocksaddrHostPort("127.0.0.1", targetPort))
+			require.NoError(subTest, err)
+			_, err = proxyConn.Write([]byte{1})
+			require.NoError(subTest, err)
+			require.NoError(subTest, N.CloseWrite(proxyConn))
+			require.NoError(subTest, proxyConn.SetReadDeadline(time.Now().Add(20*time.Second)))
+			response := make([]byte, len(payload))
+			_, err = io.ReadFull(proxyConn, response)
+			require.NoError(subTest, err)
+			require.True(subTest, bytes.Equal(payload, response), "response payload mismatch")
+			require.NoError(subTest, proxyConn.Close())
+
+			metrics := recordingServerConn.PayloadGrowthMetrics(subTest)
+			subTest.Logf("payload bytes: %d, records: %d, max before 1 MiB: %d, first max offset: %d",
+				metrics.payloadBytes, metrics.recordCount, metrics.maxPayloadBefore1MiB, metrics.firstMaxPayloadOffset)
+			require.Equal(subTest, len(payload)+1, metrics.payloadBytes)
+			require.True(subTest, metrics.foundMaxPayload, "payload limit never reached the protocol ceiling")
+			// Repeated snell-server v5.0.1 runs reach the 16,383-byte ceiling well
+			// after the first MiB but before the third. Check that wider behavioral
+			// invariant: small Go copy buffers must not drive the limit near its
+			// ceiling during the first MiB, and growth must not stall.
+			require.Greater(subTest, metrics.firstMaxPayloadOffset, 1024*1024)
+			require.Less(subTest, metrics.firstMaxPayloadOffset, 3*1024*1024)
+			require.Less(subTest, metrics.maxPayloadBefore1MiB, 15*1024)
 		})
 	}
 }
