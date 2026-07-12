@@ -419,6 +419,10 @@ type httpObfsClientConn struct {
 	wrote       bool
 }
 
+func (c *httpObfsClientConn) Upstream() any {
+	return c.Conn
+}
+
 func (c *httpObfsClientConn) Read(p []byte) (int, error) {
 	c.readAccess.Lock()
 	if c.reader == nil {
@@ -456,6 +460,10 @@ type httpObfsServerConn struct {
 	writeAccess sync.Mutex
 	reader      io.Reader
 	wrote       bool
+}
+
+func (c *httpObfsServerConn) Upstream() any {
+	return c.Conn
 }
 
 func (c *httpObfsServerConn) Read(p []byte) (int, error) {
@@ -496,6 +504,10 @@ type tlsObfsClientConn struct {
 	readRemaining int
 	firstResponse bool
 	wrote         bool
+}
+
+func (c *tlsObfsClientConn) Upstream() any {
+	return c.Conn
 }
 
 func (c *tlsObfsClientConn) Read(p []byte) (int, error) {
@@ -585,6 +597,10 @@ type tlsObfsServerConn struct {
 	firstRequest      bool
 	sessionTicketDone bool
 	firstResponse     bool
+}
+
+func (c *tlsObfsServerConn) Upstream() any {
+	return c.Conn
 }
 
 func (c *tlsObfsServerConn) Read(p []byte) (int, error) {
