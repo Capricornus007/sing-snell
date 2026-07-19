@@ -72,6 +72,12 @@ func (c *Client) reuseSession(ctx context.Context) (*reuseSession, error) {
 	return session, nil
 }
 
+func (c *Client) Reset() {
+	if c.reuse {
+		c.pool.Reset()
+	}
+}
+
 func (c *Client) Close() error {
 	return c.pool.Close()
 }

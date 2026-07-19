@@ -205,6 +205,23 @@ func (p *Pool[S]) DrainDone() {
 	p.drainWg.Done()
 }
 
+func (p *Pool[S]) Reset() {
+	p.access.Lock()
+	if p.closed {
+		p.access.Unlock()
+		return
+	}
+	var sessions []S
+	for element := p.entries.Front(); element != nil; element = element.Next() {
+		sessions = append(sessions, element.Value.session)
+	}
+	p.entries.Init()
+	p.access.Unlock()
+	for _, session := range sessions {
+		session.Close()
+	}
+}
+
 func (p *Pool[S]) Close() error {
 	p.access.Lock()
 	if p.closed {
