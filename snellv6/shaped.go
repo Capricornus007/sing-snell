@@ -211,27 +211,16 @@ func (w *shapedWriter) WritePacketBuffer(buffer *buf.Buffer) error {
 		buffer.Release()
 		return nil
 	}
-	w.access.Lock()
-	defer w.access.Unlock()
-	nowUnix := time.Now().Unix()
-	chunkSize := w.chunkSize
-	if w.lastWriteUnix == 0 || nowUnix-w.lastWriteUnix > int64(w.profile.idleResetSec) {
-		chunkSize = w.profile.chunkInitial
-	}
-	if chunkSize == 0 {
-		chunkSize = w.profile.chunkInitial
-	}
-	payloadLimit := w.profile.chunkPayloadLimit(w.seq, chunkSize)
-	if w.seq == 0 {
-		payloadLimit = min(payloadLimit, w.profile.firstRecordCap)
-	}
-	payloadLimit = max(1, min(payloadLimit, maxPayload))
-	if dataLen > payloadLimit {
+	if dataLen > maxPayload {
 		buffer.Release()
 		return snell.ErrPayloadTooLarge
 	}
-	w.chunkSize = w.profile.nextChunkSize(chunkSize)
-	w.lastWriteUnix = nowUnix
+	w.access.Lock()
+	defer w.access.Unlock()
+	// snell-server v6.0.0rc: UDP packet mode still advances the dynamic chunk
+	// state, but emits each complete datagram as one record regardless of the
+	// current stream chunk limit.
+	w.payloadLimitFor(time.Now())
 	record := w.makeBufferRecord(buffer)
 	_, err := w.upstream.Write(record.Bytes())
 	record.Release()
@@ -315,6 +304,10 @@ type packetVectorisedShapedWriter struct {
 }
 
 func (w *packetVectorisedShapedWriter) WriteVectorised(buffers []*buf.Buffer) error {
+	err := validatePacketVectorBuffers(buffers)
+	if err != nil {
+		return err
+	}
 	var records []*buf.Buffer
 	defer func() {
 		buf.ReleaseMulti(records)
@@ -322,32 +315,12 @@ func (w *packetVectorisedShapedWriter) WriteVectorised(buffers []*buf.Buffer) er
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()
-	for index, buffer := range buffers {
+	for _, buffer := range buffers {
 		if buffer.IsEmpty() {
 			buffer.Release()
 			continue
 		}
-		dataLen := buffer.Len()
-		nowUnix := time.Now().Unix()
-		chunkSize := recordWriter.chunkSize
-		if recordWriter.lastWriteUnix == 0 || nowUnix-recordWriter.lastWriteUnix > int64(recordWriter.profile.idleResetSec) {
-			chunkSize = recordWriter.profile.chunkInitial
-		}
-		if chunkSize == 0 {
-			chunkSize = recordWriter.profile.chunkInitial
-		}
-		payloadLimit := recordWriter.profile.chunkPayloadLimit(recordWriter.seq, chunkSize)
-		if recordWriter.seq == 0 {
-			payloadLimit = min(payloadLimit, recordWriter.profile.firstRecordCap)
-		}
-		payloadLimit = max(1, min(payloadLimit, maxPayload))
-		if dataLen > payloadLimit {
-			buffer.Release()
-			buf.ReleaseMulti(buffers[index+1:])
-			return snell.ErrPayloadTooLarge
-		}
-		recordWriter.chunkSize = recordWriter.profile.nextChunkSize(chunkSize)
-		recordWriter.lastWriteUnix = nowUnix
+		recordWriter.payloadLimitFor(time.Now())
 		record := recordWriter.makeBufferRecord(buffer)
 		records = append(records, record)
 	}
