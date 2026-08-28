@@ -3,6 +3,7 @@ package multiuser
 import (
 	"errors"
 	"math"
+	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -212,12 +213,7 @@ func matchParallel[T any, M credentialMatcher[T]](
 }
 
 func contains(indexes []int, target int) bool {
-	for _, index := range indexes {
-		if index == target {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(indexes, target)
 }
 
 func (a *Authenticator) record(index int) {

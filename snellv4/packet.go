@@ -90,7 +90,7 @@ func (c *clientPacketConn) readReply() (*reader, error) {
 }
 
 func (c *clientPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	if buffer.IsEmpty() && destination.IsFqdn() {
+	if buffer.IsEmpty() && destination.IsDomain() {
 		buffer.Release()
 		return snell.ErrEmptyDomainUDPPayload
 	}
@@ -148,7 +148,7 @@ func (w *clientPacketBatchWriter) WritePacketBatch(buffers []*buf.Buffer, destin
 		return os.ErrInvalid
 	}
 	for index, buffer := range buffers {
-		if buffer.IsEmpty() && destinations[index].IsFqdn() {
+		if buffer.IsEmpty() && destinations[index].IsDomain() {
 			buf.ReleaseMulti(buffers)
 			return snell.ErrEmptyDomainUDPPayload
 		}

@@ -13,8 +13,10 @@ import (
 )
 
 func TestDialContextDefersRequestHandshake(t *testing.T) {
+	t.Parallel()
 	for _, reuse := range []bool{false, true} {
 		t.Run(map[bool]string{false: "direct", true: "reuse"}[reuse], func(t *testing.T) {
+			t.Parallel()
 			upstream := newCaptureConn()
 			client, err := NewClient(ClientOptions{
 				PSK:    []byte("lazy-handshake-test-psk"),

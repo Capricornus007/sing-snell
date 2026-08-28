@@ -118,10 +118,11 @@ func (c *QUICProxyPacketConn) WritePacket(buffer *buf.Buffer, _ M.Socksaddr) err
 	return err
 }
 
-func (c *QUICProxyPacketConn) Close() error                       { return c.conn.Close() }
-func (c *QUICProxyPacketConn) LocalAddr() net.Addr                { return c.conn.LocalAddr() }
-func (c *QUICProxyPacketConn) SetDeadline(t time.Time) error      { return c.conn.SetDeadline(t) }
-func (c *QUICProxyPacketConn) SetReadDeadline(t time.Time) error  { return c.conn.SetReadDeadline(t) }
+func (c *QUICProxyPacketConn) Close() error                      { return c.conn.Close() }
+func (c *QUICProxyPacketConn) LocalAddr() net.Addr               { return c.conn.LocalAddr() }
+func (c *QUICProxyPacketConn) SetDeadline(t time.Time) error     { return c.conn.SetDeadline(t) }
+func (c *QUICProxyPacketConn) SetReadDeadline(t time.Time) error { return c.conn.SetReadDeadline(t) }
+
 func (c *QUICProxyPacketConn) SetWriteDeadline(t time.Time) error { return c.conn.SetWriteDeadline(t) }
 
 type QUICProxySession struct {

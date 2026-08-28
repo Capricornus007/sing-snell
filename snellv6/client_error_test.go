@@ -14,11 +14,13 @@ import (
 )
 
 func TestClientReportsServerError(t *testing.T) {
+	t.Parallel()
 	const message = "IPv6 target is disabled by server configuration"
 	psk := []byte("server-error-test-psk")
 	for _, mode := range []Mode{ModeDefault, ModeUnshaped, ModeUnsafeRaw} {
 		for _, reuseEnabled := range []bool{false, true} {
 			t.Run(mode.String()+"/reuse="+strconv.FormatBool(reuseEnabled), func(t *testing.T) {
+				t.Parallel()
 				clientSide, serverSide := net.Pipe()
 				defer clientSide.Close()
 				defer serverSide.Close()

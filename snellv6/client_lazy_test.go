@@ -13,6 +13,7 @@ import (
 )
 
 func TestDialContextDefersRequestHandshake(t *testing.T) {
+	t.Parallel()
 	for _, testCase := range []struct {
 		name string
 		mode Mode
@@ -22,8 +23,10 @@ func TestDialContextDefersRequestHandshake(t *testing.T) {
 		{name: "unsafe-raw", mode: ModeUnsafeRaw},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
 			for _, reuse := range []bool{false, true} {
 				t.Run(map[bool]string{false: "direct", true: "reuse"}[reuse], func(t *testing.T) {
+					t.Parallel()
 					upstream := newCaptureConn()
 					client, err := NewClient(ClientOptions{
 						PSK:    []byte("lazy-handshake-test-psk"),

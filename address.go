@@ -99,7 +99,7 @@ func WriteUDPResponseAddressPreserveMapped(buffer *buf.Buffer, source M.Socksadd
 }
 
 func writeUDPResponseAddress(buffer *buf.Buffer, source M.Socksaddr, preserveMapped bool) error {
-	if source.IsFqdn() {
+	if source.IsDomain() {
 		return udpResponseSerializer.WriteAddrPort(buffer, source)
 	}
 	if !preserveMapped {
@@ -125,7 +125,7 @@ func UDPResponseAddressLenPreserveMapped(source M.Socksaddr) int {
 }
 
 func udpResponseAddressLen(source M.Socksaddr, preserveMapped bool) int {
-	if source.IsFqdn() {
+	if source.IsDomain() {
 		return 1 + 1 + len(source.Fqdn) + 2
 	}
 	if !preserveMapped {
