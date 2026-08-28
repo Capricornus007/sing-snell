@@ -316,10 +316,11 @@ func (c *clientConn) FrontHeadroom() int {
 }
 
 func (c *clientConn) command() byte {
-	if c.client.reuse {
-		return snell.CommandConnectV2
-	}
-	return snell.CommandConnect
+	// Surge 6.7.0 (11520): SNConnectorV4::targetHandshakeData writes command 5
+	// for v4/v5 TCP handshakes even when connector reuse is disabled, and the
+	// official snell-server closes the connection on command 1 (verified
+	// against snell-server v4.1.1 / v5.0.1 in test/).
+	return snell.CommandConnectV2
 }
 
 func (c *clientConn) RearHeadroom() int {
