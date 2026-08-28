@@ -149,7 +149,7 @@ func (h connectionTypeHandler) NewConnectionEx(_ context.Context, conn net.Conn,
 func (connectionTypeHandler) NewPacketConnectionEx(context.Context, N.PacketConn, M.Socksaddr, M.Socksaddr, N.CloseHandlerFunc) {
 }
 
-func TestV4ClientCommandFollowsReuse(t *testing.T) {
+func TestV4ClientAlwaysSendsCommandV2(t *testing.T) {
 	for _, reuseEnabled := range []bool{false, true} {
 		t.Run(fmt.Sprintf("reuse-%t", reuseEnabled), func(t *testing.T) {
 			psk := []byte("test-password")
@@ -167,11 +167,10 @@ func TestV4ClientCommandFollowsReuse(t *testing.T) {
 			proxyConn, err := client.DialConn(clientRaw, M.ParseSocksaddr("example.com:443"))
 			require.NoError(t, err)
 			connectionType := <-handler.types
-			if reuseEnabled {
-				require.True(t, strings.Contains(connectionType, "serverReuseConn"), connectionType)
-			} else {
-				require.True(t, strings.HasSuffix(connectionType, ".serverConn"), connectionType)
-			}
+			// Surge always writes command 5 for v4/v5 TCP handshakes, and the
+			// official snell-server drops connections that do otherwise, so the
+			// server side is reuse-capable regardless of the client setting.
+			require.True(t, strings.Contains(connectionType, "serverReuseConn"), connectionType)
 			_ = proxyConn.Close()
 			_ = clientRaw.Close()
 			_ = serverRaw.Close()

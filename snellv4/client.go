@@ -277,11 +277,10 @@ func (c *clientConn) CloseWrite() error {
 				return
 			}
 		}
-		if c.client.reuse {
-			c.closeWriteErr = c.writer.WriteZeroChunk()
-		} else {
-			c.closeWriteErr = N.CloseWrite(c.Conn)
-		}
+		// The official snell-server treats a TCP FIN as "tear the whole
+		// connection down", so the half-close must be signalled inside the
+		// protocol with a zero-length chunk -- also in non-reuse mode.
+		c.closeWriteErr = c.writer.WriteZeroChunk()
 	})
 	return c.closeWriteErr
 }
