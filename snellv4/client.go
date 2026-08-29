@@ -32,6 +32,7 @@ type ClientOptions struct {
 	Reuse    bool
 	ObfsMode snell.ObfsMode
 	ObfsHost string
+	ObfsURI  string
 	Dialer   N.Dialer
 	Server   M.Socksaddr
 }
@@ -52,7 +53,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		psk:     options.PSK,
 		userKey: options.UserKey,
 		reuse:   options.Reuse,
-		obfs:    snell.ObfsConfig{Mode: options.ObfsMode, Host: options.ObfsHost},
+		obfs:    snell.ObfsConfig{Mode: options.ObfsMode, Host: options.ObfsHost, URI: options.ObfsURI},
 		dialer:  options.Dialer,
 		server:  options.Server,
 	}
