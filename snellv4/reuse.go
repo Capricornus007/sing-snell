@@ -344,6 +344,19 @@ func (c *reuseConn) writeRequestBuffer(buffer *buf.Buffer) error {
 }
 
 func (c *reuseConn) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		// 本地語義（da39299 半關閉修復）：Write(nil) 決不能觸發 zero-length
+		// EOF record——半關閉只允許通過 CloseWrite() 顯式進行。這裡只確保
+		// 請求握手已完成（092487a 延遲握手）。
+		c.access.Lock()
+		defer c.access.Unlock()
+		if c.writer == nil {
+			if err := c.writeRequest(nil); err != nil {
+				return 0, err
+			}
+		}
+		return 0, nil
+	}
 	if c.writer != nil {
 		return c.writer.Write(p)
 	}
