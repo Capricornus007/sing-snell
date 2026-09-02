@@ -97,7 +97,7 @@ func (c ObfsConfig) ClientConn(conn net.Conn) net.Conn {
 	case ObfsModeHTTP:
 		return &httpObfsClientConn{Conn: conn, config: c, head: httpObfsHead{upstream: conn}}
 	case ObfsModeTLS:
-		return &tlsObfsClientConn{tlsObfsRecords: tlsObfsRecords{Conn: conn}, config: c}
+		return &tlsObfsClientConn{Conn: conn, config: c}
 	default:
 		panic("snell: invalid obfs mode")
 	}
@@ -110,7 +110,7 @@ func (c ObfsConfig) ServerConn(conn net.Conn) net.Conn {
 	case ObfsModeHTTP:
 		return &httpObfsServerConn{Conn: conn, head: httpObfsHead{upstream: conn}}
 	case ObfsModeTLS:
-		return &tlsObfsServerConn{tlsObfsRecords: tlsObfsRecords{Conn: conn}}
+		return &tlsObfsServerConn{Conn: conn}
 	default:
 		panic("snell: invalid obfs mode")
 	}
