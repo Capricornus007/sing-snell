@@ -47,11 +47,8 @@ func (c *Client) DialContext(ctx context.Context, destination M.Socksaddr) (net.
 	if err != nil {
 		return nil, err
 	}
-<<<<<<< HEAD
-=======
 	// Surge 6.4.4 (10661): -[SNConnectorV4 targetHandshakeData] appends the connector early data to
 	// the handshake buffer, so the first record carries both.
->>>>>>> up/main
 	return c.DialEarlyConn(conn, destination), nil
 }
 
@@ -117,7 +114,6 @@ func (s *reuseSession) DialConn(destination M.Socksaddr) (net.Conn, error) {
 	return &reuseConn{Conn: s.Conn, session: s, destination: destination}, nil
 }
 
-<<<<<<< HEAD
 func (s *reuseSession) requestPayload(destination M.Socksaddr, payload []byte) (*buf.Buffer, error) {
 	requestPayload := snell.Request{Command: snell.CommandConnectV2, ClientID: s.client.userKey, Destination: destination}
 	request := buf.NewSize(requestPayload.Len() + len(payload))
@@ -178,9 +174,6 @@ func (s *reuseSession) writeRequestBuffer(destination M.Socksaddr, buffer *buf.B
 		return E.Cause(err, "write request")
 	}
 	return nil
-=======
-	return &reuseConn{Conn: s.Conn, session: s, destination: destination}, nil
->>>>>>> up/main
 }
 
 func (s *reuseSession) Release(reusable bool) {
