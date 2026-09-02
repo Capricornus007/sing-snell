@@ -395,64 +395,6 @@ func (c *reuseConn) ReadBuffer(buffer *buf.Buffer) error {
 	}
 }
 
-func (c *reuseConn) writeRequest(payload []byte) error {
-	requestPayload := snell.Request{Command: snell.CommandConnectV2, ClientID: c.session.client.userKey, Destination: c.destination}
-	request := buf.NewSize(requestPayload.Len() + len(payload))
-	err := requestPayload.Write(request)
-	if err != nil {
-		request.Release()
-		return err
-	}
-	if len(payload) > 0 {
-		common.Must1(request.Write(payload))
-	}
-	defer request.Release()
-
-	data := request.Bytes()
-	if c.session.writer == nil {
-		first := data
-		if len(first) > maxPayload {
-			first = data[:maxPayload]
-		}
-		c.session.writer, err = writeFirstRecord(c.session.Conn, c.session.client.mode, c.session.client.psk, c.session.client.profile, first)
-		if err != nil {
-			c.session.Release(false)
-			return E.Cause(err, "write request")
-		}
-		data = data[len(first):]
-	}
-	if len(data) > 0 {
-		_, err = c.session.writer.Write(data)
-		if err != nil {
-			c.session.Release(false)
-			return E.Cause(err, "write request")
-		}
-	}
-	c.writer = c.session.writer
-	return nil
-}
-
-func (c *reuseConn) writeRequestBuffer(buffer *buf.Buffer) error {
-	requestPayload := snell.Request{Command: snell.CommandConnectV2, ClientID: c.session.client.userKey, Destination: c.destination}
-	request := buf.With(buffer.ExtendHeader(requestPayload.Len()))
-	err := requestPayload.Write(request)
-	if err != nil {
-		buffer.Release()
-		return err
-	}
-	if c.session.writer == nil {
-		c.session.writer, err = writeFirstRecordBuffer(c.session.Conn, c.session.client.mode, c.session.client.psk, c.session.client.profile, buffer)
-	} else {
-		err = c.session.writer.WriteBuffer(buffer)
-	}
-	if err != nil {
-		c.session.Release(false)
-		return E.Cause(err, "write request")
-	}
-	c.writer = c.session.writer
-	return nil
-}
-
 func (c *reuseConn) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, c.ensureRequest()
