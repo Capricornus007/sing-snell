@@ -61,6 +61,7 @@ func (c *Client) reuseSession(ctx context.Context) (*reuseSession, error) {
 		return nil, E.New("snell: missing dialer")
 	}
 	if found {
+		session.generation = c.generation.Load()
 		return session, nil
 	}
 	conn, err := c.dialer.DialContext(ctx, N.NetworkTCP, c.server)
@@ -72,11 +73,19 @@ func (c *Client) reuseSession(ctx context.Context) (*reuseSession, error) {
 		return nil, net.ErrClosed
 	}
 	session = c.newReuseSession(conn)
+	session.generation = c.generation.Load()
 	session.state.Store(uint32(reuse.StateActive))
 	return session, nil
 }
 
 func (c *Client) Reset() {
+	if c.reuse {
+		c.pool.Reset()
+	}
+}
+
+func (c *Client) CloseIdleConnections() {
+	c.generation.Add(1)
 	if c.reuse {
 		c.pool.Reset()
 	}
@@ -90,9 +99,10 @@ type reuseSession struct {
 	net.Conn
 	client *Client
 
-	state  atomic.Uint32
-	reader reuse.RecordReader
-	writer reuse.RecordWriter
+	state      atomic.Uint32
+	generation uint64
+	reader     reuse.RecordReader
+	writer     reuse.RecordWriter
 }
 
 func (c *Client) newReuseSession(conn net.Conn) *reuseSession {
@@ -181,6 +191,10 @@ func (s *reuseSession) Release(reusable bool) {
 		s.Close()
 		return
 	}
+	if s.generation != s.client.generation.Load() {
+		s.Close()
+		return
+	}
 	if !s.state.CompareAndSwap(uint32(reuse.StateActive), uint32(reuse.StateReady)) {
 		if reuse.State(s.state.Load()) != reuse.StateClosed {
 			s.Close()
@@ -198,6 +212,10 @@ func (s *reuseSession) Close() error {
 }
 
 func (s *reuseSession) startDrain() {
+	if s.generation != s.client.generation.Load() {
+		s.Close()
+		return
+	}
 	if !s.state.CompareAndSwap(uint32(reuse.StateActive), uint32(reuse.StateWaiting)) {
 		if reuse.State(s.state.Load()) != reuse.StateClosed {
 			s.Close()

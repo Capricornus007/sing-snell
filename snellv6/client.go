@@ -24,7 +24,8 @@ type Client struct {
 	dialer  N.Dialer
 	server  M.Socksaddr
 
-	pool reuse.Pool[*reuseSession]
+	pool       reuse.Pool[*reuseSession]
+	generation atomic.Uint64
 }
 
 type ClientOptions struct {
