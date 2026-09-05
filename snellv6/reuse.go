@@ -30,6 +30,9 @@ func (c *Client) DialContext(ctx context.Context, destination M.Socksaddr) (net.
 		if err != nil {
 			return nil, err
 		}
+		if snell.KeepSessionFromContext(ctx) {
+			session.keepSession.Store(true)
+		}
 		conn, err := session.DialConn(destination)
 		if err != nil {
 			session.Close()
@@ -84,6 +87,14 @@ func (c *Client) Reset() {
 	}
 }
 
+func (c *Client) SetKeepIdleConnections(keep bool) {
+	// 本地 generation 方案：keep=false 时递增 generation 使旧会话失效；
+	// keep=true 无需动作（会话本就持续复用）。
+	if !keep {
+		c.CloseIdleConnections()
+	}
+}
+
 func (c *Client) CloseIdleConnections() {
 	c.generation.Add(1)
 	if c.reuse {
@@ -99,10 +110,11 @@ type reuseSession struct {
 	net.Conn
 	client *Client
 
-	state      atomic.Uint32
-	generation uint64
-	reader     reuse.RecordReader
-	writer     reuse.RecordWriter
+	state       atomic.Uint32
+	generation  uint64
+	keepSession atomic.Bool
+	reader      reuse.RecordReader
+	writer      reuse.RecordWriter
 }
 
 func (c *Client) newReuseSession(conn net.Conn) *reuseSession {
@@ -187,7 +199,7 @@ func (s *reuseSession) writeRequestBuffer(destination M.Socksaddr, buffer *buf.B
 }
 
 func (s *reuseSession) Release(reusable bool) {
-	if !reusable {
+	if !reusable && !s.keepSession.Load() {
 		s.Close()
 		return
 	}
