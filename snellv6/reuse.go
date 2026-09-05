@@ -88,8 +88,9 @@ func (c *Client) Reset() {
 }
 
 func (c *Client) SetKeepIdleConnections(keep bool) {
-	// 本地 generation 方案：keep=false 时递增 generation 使旧会话失效；
-	// keep=true 无需动作（会话本就持续复用）。
+	// 上游语义：closeIdle 标志决定 Close 路径是否保留 idle 会话（keep-once 豁免可救一次）；
+	// keep=false 时同时清理现有会话（本地 generation 方案在此之上使旧世代会话失效）。
+	c.closeIdle.Store(!keep)
 	if !keep {
 		c.CloseIdleConnections()
 	}
@@ -198,8 +199,14 @@ func (s *reuseSession) writeRequestBuffer(destination M.Socksaddr, buffer *buf.B
 	return nil
 }
 
+// closeIdle 上报是否应放弃复用该会话：策略为不保留时，keepSession 作为一次性
+// keep-once 豁免被本次调用消费（Swap(false)），豁免过的下一次不再豁免。
+func (s *reuseSession) closeIdle() bool {
+	return s.client.closeIdle.Load() && !s.keepSession.Swap(false)
+}
+
 func (s *reuseSession) Release(reusable bool) {
-	if !reusable && !s.keepSession.Load() {
+	if !reusable || s.closeIdle() {
 		s.Close()
 		return
 	}
@@ -531,6 +538,10 @@ func (c *reuseConn) Close() error {
 		c.session.Conn.SetWriteDeadline(time.Time{})
 		if c.readClosed.Load() {
 			c.session.Release(true)
+			return
+		}
+		if c.session.closeIdle() {
+			c.session.Close()
 			return
 		}
 		// Surge 6.7.0 (11520): SNConnectorV4::readServerEOFIfNotInReadState: starts waiting-state EOF

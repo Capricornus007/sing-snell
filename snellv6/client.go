@@ -26,6 +26,7 @@ type Client struct {
 
 	pool       reuse.Pool[*reuseSession]
 	generation atomic.Uint64
+	closeIdle  atomic.Bool
 }
 
 type ClientOptions struct {
