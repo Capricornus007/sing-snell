@@ -11,6 +11,7 @@ import (
 )
 
 func TestKeepSessionSurvivesCloseOnce(t *testing.T) {
+	t.Parallel()
 	for _, testCase := range []struct {
 		name       string
 		keep       bool
@@ -22,6 +23,7 @@ func TestKeepSessionSurvivesCloseOnce(t *testing.T) {
 		{name: "eof-not-kept", readClosed: true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
 			upstream := newCaptureConn()
 			client, err := NewClient(ClientOptions{
 				PSK:    []byte("keep-session-test-psk"),
