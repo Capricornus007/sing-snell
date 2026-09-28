@@ -50,8 +50,6 @@ func (c *Client) DialContext(ctx context.Context, destination M.Socksaddr) (net.
 	if err != nil {
 		return nil, err
 	}
-	// Surge 6.4.4 (10661): -[SNConnectorV4 targetHandshakeData] appends the connector early data to
-	// the handshake buffer, so the first record carries both.
 	return c.DialEarlyConn(conn, destination), nil
 }
 
@@ -134,7 +132,27 @@ func (s *reuseSession) DialConn(destination M.Socksaddr) (net.Conn, error) {
 	if state != reuse.StateActive {
 		return nil, E.New("snell: reuse session is busy")
 	}
-	return &reuseConn{Conn: s.Conn, session: s, destination: destination}, nil
+	// Snapshot buffer requirements before publishing the logical connection.
+	// Metadata queries may run concurrently with the lazy request handshake.
+	request := snell.Request{Command: snell.CommandConnectV2, ClientID: s.client.userKey, Destination: destination}
+	var recordHeadroom, saltHeadroom int
+	switch s.client.mode {
+	case ModeUnsafeRaw:
+		recordHeadroom = snell.HeaderPlainLen
+	case ModeUnshaped:
+		recordHeadroom, saltHeadroom = snell.HeaderCipherLen, snell.SaltLen
+	default:
+		recordHeadroom = s.client.profile.recordPrefixMax + snell.HeaderCipherLen + s.client.profile.padMaxHeadroom
+		saltHeadroom = s.client.profile.saltBlockLen
+	}
+	requestHeadroom := request.Len() + recordHeadroom
+	if s.writer == nil {
+		requestHeadroom += saltHeadroom
+	}
+	return &reuseConn{
+		Conn: s.Conn, session: s, destination: destination,
+		requestHeadroom: requestHeadroom, recordHeadroom: recordHeadroom,
+	}, nil
 }
 
 func (s *reuseSession) requestPayload(destination M.Socksaddr, payload []byte) (*buf.Buffer, error) {
@@ -273,8 +291,10 @@ func (s *reuseSession) drain() {
 
 type reuseConn struct {
 	net.Conn
-	session     *reuseSession
-	destination M.Socksaddr
+	session         *reuseSession
+	destination     M.Socksaddr
+	requestHeadroom int
+	recordHeadroom  int
 
 	access          sync.Mutex
 	requestWritten  atomic.Bool
@@ -286,7 +306,7 @@ type reuseConn struct {
 	readWaitOptions N.ReadWaitOptions
 	closed          atomic.Bool
 	readActionCount atomic.Int32
-	readClosed      atomic.Bool
+	readClosed      atomic.Bool // EOF belongs to this logical connection, not the shared reader.
 }
 
 func (c *reuseConn) readResponse() error {
@@ -359,6 +379,9 @@ func (c *reuseConn) Read(p []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, net.ErrClosed
 	}
+	if c.readClosed.Load() {
+		return 0, io.EOF
+	}
 	err := c.readResponse()
 	if err != nil {
 		return 0, err
@@ -398,6 +421,9 @@ func (c *reuseConn) ReadBuffer(buffer *buf.Buffer) error {
 	defer c.readActionCount.Add(-1)
 	if c.closed.Load() {
 		return net.ErrClosed
+	}
+	if c.readClosed.Load() {
+		return io.EOF
 	}
 	err := c.readResponse()
 	if err != nil {
@@ -593,6 +619,9 @@ func (w *reuseReadWaiter) WaitReadBuffer() (*buf.Buffer, error) {
 	if w.conn.closed.Load() {
 		return nil, net.ErrClosed
 	}
+	if w.conn.readClosed.Load() {
+		return nil, io.EOF
+	}
 	err := w.conn.readResponse()
 	if err != nil {
 		return nil, err
@@ -628,41 +657,24 @@ func (w *reuseReadWaiter) WaitReadBuffer() (*buf.Buffer, error) {
 }
 
 func (c *reuseConn) FrontHeadroom() int {
-	if c.requestWritten.Load() {
-		return c.session.writer.FrontHeadroom()
+	if !c.requestWritten.Load() {
+		return c.requestHeadroom
 	}
-	requestPayload := snell.Request{Command: snell.CommandConnectV2, ClientID: c.session.client.userKey, Destination: c.destination}
-	if c.session.writer != nil {
-		return requestPayload.Len() + c.session.writer.FrontHeadroom()
-	}
-	switch c.session.client.mode {
-	case ModeUnsafeRaw:
-		return requestPayload.Len() + snell.HeaderPlainLen
-	case ModeUnshaped:
-		return requestPayload.Len() + snell.SaltLen + snell.HeaderCipherLen
-	default:
-		return requestPayload.Len() + c.session.client.profile.saltBlockLen + c.session.client.profile.recordPrefixMax + snell.HeaderCipherLen + c.session.client.profile.padMaxHeadroom
-	}
+	return c.recordHeadroom
 }
 
 func (c *reuseConn) RearHeadroom() int {
-	if !c.requestWritten.Load() && c.session.writer == nil {
-		if c.session.client.mode == ModeUnsafeRaw {
-			return 0
-		}
-		return snell.AEADTagLen
+	if c.session.client.mode == ModeUnsafeRaw {
+		return 0
 	}
-	return c.session.writer.RearHeadroom()
+	return snell.AEADTagLen
 }
 
 func (c *reuseConn) WriterMTU() int {
-	if !c.requestWritten.Load() && c.session.writer == nil {
-		if c.session.client.mode == ModeDefault {
-			return c.session.client.profile.chunkMax
-		}
-		return maxPayload
+	if c.session.client.mode == ModeDefault {
+		return c.session.client.profile.chunkMax
 	}
-	return c.session.writer.WriterMTU()
+	return maxPayload
 }
 
 func (c *reuseConn) NeedHandshakeForRead() bool {
@@ -833,7 +845,7 @@ type serverReuseConn[U comparable] struct {
 	closeWriteErr  error
 	closeOnce      sync.Once
 	closeErr       error
-	readClosed     atomic.Bool
+	readClosed     atomic.Bool // EOF belongs to this logical connection, not the shared reader.
 	aborted        atomic.Bool
 	replyWritten   bool
 	writeClosed    bool
@@ -908,6 +920,9 @@ func (c *serverReuseConn[U]) writeErrorResponse() error {
 }
 
 func (c *serverReuseConn[U]) Read(p []byte) (int, error) {
+	if c.readClosed.Load() {
+		return 0, io.EOF
+	}
 	n, err := c.session.reader.Read(p)
 	if errors.Is(err, io.EOF) {
 		c.readClosed.Store(true)
@@ -916,6 +931,9 @@ func (c *serverReuseConn[U]) Read(p []byte) (int, error) {
 }
 
 func (c *serverReuseConn[U]) ReadBuffer(buffer *buf.Buffer) error {
+	if c.readClosed.Load() {
+		return io.EOF
+	}
 	err := c.session.reader.ReadBuffer(buffer)
 	if errors.Is(err, io.EOF) {
 		c.readClosed.Store(true)
@@ -1035,6 +1053,9 @@ func (c *serverReuseConn[U]) InitializeReadWaiter(options N.ReadWaitOptions) (ne
 }
 
 func (c *serverReuseConn[U]) WaitReadBuffer() (*buf.Buffer, error) {
+	if c.readClosed.Load() {
+		return nil, io.EOF
+	}
 	buffer, err := c.session.reader.WaitReadBuffer()
 	if errors.Is(err, io.EOF) {
 		c.readClosed.Store(true)

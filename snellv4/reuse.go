@@ -127,7 +127,14 @@ func (s *reuseSession) DialConn(destination M.Socksaddr) (net.Conn, error) {
 	if state != reuse.StateActive {
 		return nil, E.New("snell: reuse session is busy")
 	}
-	return &reuseConn{Conn: s.Conn, session: s, destination: destination}, nil
+	// Snapshot buffer requirements before publishing the logical connection.
+	// Metadata queries may run concurrently with the lazy request handshake.
+	request := snell.Request{Command: snell.CommandConnectV2, ClientID: s.client.userKey, Destination: destination}
+	requestHeadroom := request.Len() + snell.HeaderCipherLen
+	if s.writer == nil {
+		requestHeadroom += snell.SaltLen + maxInitialPaddingLen
+	}
+	return &reuseConn{Conn: s.Conn, session: s, destination: destination, requestHeadroom: requestHeadroom}, nil
 }
 
 // closeIdle 上报是否应放弃复用该会话：策略为不保留时，keepSession 作为一次性
@@ -258,8 +265,9 @@ func (s *reuseSession) drain() {
 
 type reuseConn struct {
 	net.Conn
-	session     *reuseSession
-	destination M.Socksaddr
+	session         *reuseSession
+	destination     M.Socksaddr
+	requestHeadroom int
 
 	access          sync.Mutex
 	requestWritten  atomic.Bool
@@ -271,7 +279,7 @@ type reuseConn struct {
 	readWaitOptions N.ReadWaitOptions
 	closed          atomic.Bool
 	readActionCount atomic.Int32
-	readClosed      atomic.Bool
+	readClosed      atomic.Bool // EOF belongs to this logical connection, not the shared reader.
 }
 
 func (c *reuseConn) readResponse() error {
@@ -344,6 +352,9 @@ func (c *reuseConn) Read(p []byte) (int, error) {
 	if c.closed.Load() {
 		return 0, net.ErrClosed
 	}
+	if c.readClosed.Load() {
+		return 0, io.EOF
+	}
 	err := c.readResponse()
 	if err != nil {
 		return 0, err
@@ -383,6 +394,9 @@ func (c *reuseConn) ReadBuffer(buffer *buf.Buffer) error {
 	defer c.readActionCount.Add(-1)
 	if c.closed.Load() {
 		return net.ErrClosed
+	}
+	if c.readClosed.Load() {
+		return io.EOF
 	}
 	err := c.readResponse()
 	if err != nil {
@@ -582,6 +596,9 @@ func (w *reuseReadWaiter) WaitReadBuffer() (*buf.Buffer, error) {
 	if w.conn.closed.Load() {
 		return nil, net.ErrClosed
 	}
+	if w.conn.readClosed.Load() {
+		return nil, io.EOF
+	}
 	err := w.conn.readResponse()
 	if err != nil {
 		return nil, err
@@ -620,11 +637,10 @@ func (c *reuseConn) FrontHeadroom() int {
 	if c.requestWritten.Load() {
 		return c.session.writer.FrontHeadroom()
 	}
-	requestPayload := snell.Request{Command: snell.CommandConnectV2, ClientID: c.session.client.userKey, Destination: c.destination}
-	if c.session.writer != nil {
-		return requestPayload.Len() + c.session.writer.FrontHeadroom()
-	}
-	return requestPayload.Len() + snell.SaltLen + snell.HeaderCipherLen + maxInitialPaddingLen
+	// 上游 b40a31d 在 DialConn 就把 requestHeadroom 快照下来了：metadata 查詢可能與
+	// 延遲握手並行，此處不能再即時讀 session.writer。兩式在可達狀態下數值相同
+	// （writer 存在即 saltSent，request.Len()+HeaderCipherLen）。
+	return c.requestHeadroom
 }
 
 func (c *reuseConn) RearHeadroom() int {
