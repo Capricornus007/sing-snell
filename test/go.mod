@@ -1,6 +1,6 @@
 module github.com/sagernet/sing-snell/test
 
-go 1.27.1
+go 1.28
 
 require (
 	github.com/docker/docker v28.5.2+incompatible
