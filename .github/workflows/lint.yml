@@ -34,10 +34,10 @@ jobs:
       # 不再走 make lint_install / make lint：Makefile 那頭釘 v2.13.1、而且 `make lint`
       # 會把 windows/darwin/freebsd 各跨编一遍再 lint（用戶 2026-10-11 裁：其他系統整條刪），
       # CI 只留本機（Linux）這一條。
-      - name: Install golangci-lint v2.13.1 (with x/tools that reads Go tip)
+      - name: Install golangci-lint v2.14.0 (with x/tools that reads Go tip)
         uses: Capricornus007/repo/.github/actions/setup-gcl@master
         with:
-          version: v2.13.1
+          version: v2.14.0
 
       - name: Run golangci-lint
         run: golangci-lint run ./...
