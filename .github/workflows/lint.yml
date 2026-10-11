@@ -17,14 +17,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: '1.27.1'
-          cache: true
+      - name: Install Go from the feed (golang/go master tip)
+        uses: Capricornus007/repo/.github/actions/setup-feed-go@master
 
-      - name: Install golangci-lint
-        run: make lint_install
+      # 原本那步 Go 安裝順帶開了 module 快取；composite 不管快取 → 顯式補一步。
+      - name: Cache go module
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+          key: go-${{ hashFiles('**/go.sum') }}
+
+      # 不能用 golangci-lint-action / go install：它釘 x/tools v0.50.0，讀不了 go tip 的
+      # std export data（實測 v0.50 ✗、v0.51 ✓、v0.52 ✓）→ Lint 必紅。換依賴重 build
+      # 的步驟與交叉表在 feed 倉 .github/actions/setup-gcl。
+      # 不再走 make lint_install / make lint：Makefile 那頭釘 v2.13.1、而且 `make lint`
+      # 會把 windows/darwin/freebsd 各跨编一遍再 lint（用戶 2026-10-11 裁：其他系統整條刪），
+      # CI 只留本機（Linux）這一條。
+      - name: Install golangci-lint v2.13.1 (with x/tools that reads Go tip)
+        uses: Capricornus007/repo/.github/actions/setup-gcl@master
+        with:
+          version: v2.13.1
 
       - name: Run golangci-lint
-        run: make lint
+        run: golangci-lint run ./...

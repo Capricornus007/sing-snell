@@ -13,21 +13,25 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        go-version:
-          - '1.27.1'
+    # 原本矩陣只有「Go 版本」一個維度（1.27.1），唯一用途是餵給被取代的那步 Go 安裝；
+    # 改成吃 feed 的 go-git（golang/go master tip）後沒有消費者，
+    # 留著只會讓人誤會「CI 在測 1.27.1」，故整段移除。
+    # 平台也只有 Linux（用戶 2026-10-11 裁：其他系統整條刪；本倉本來就只有 ubuntu-latest）。
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Go
-        uses: actions/setup-go@v7
+      - name: Install Go from the feed (golang/go master tip)
+        uses: Capricornus007/repo/.github/actions/setup-feed-go@master
+
+      # 原本那步 Go 安裝順帶開了 module 快取；composite 不管快取 → 顯式補一步。
+      - name: Cache go module
+        uses: actions/cache@v6
         with:
-          go-version: ${{ matrix.go-version }}
-          cache: true
+          path: |
+            ~/go/pkg/mod
+          key: go-${{ hashFiles('**/go.sum') }}
 
       - name: Run unit tests
         run: make test
