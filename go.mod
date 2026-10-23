@@ -3,8 +3,8 @@ module github.com/sagernet/sing-snell
 go 1.28
 
 require (
-	github.com/sagernet/sing v0.8.12-0.20260727003324-d096a164bc7f
-	golang.org/x/crypto v0.42.0
+	github.com/sagernet/sing v0.9.7-0.20261022215834-56e8e9fb54a4
+	golang.org/x/crypto v0.58.0
 )
 
-require golang.org/x/sys v0.41.0 // indirect
+require golang.org/x/sys v0.49.0 // indirect
