@@ -38,6 +38,6 @@ jobs:
         uses: Capricornus007/repo/.github/actions/setup-gcl@master
         with:
           version: v2.15.0
-          xtools: v0.52.0
+          xtools: v0.52.1-0.20261030190145-0f433775b36d
       - name: Run golangci-lint
         run: golangci-lint run ./...
