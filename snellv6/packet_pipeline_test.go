@@ -14,12 +14,16 @@ import (
 )
 
 func TestClientPacketConnPipelinesFirstDatagram(t *testing.T) {
+	t.Parallel()
+
 	const message = "UDP is disabled by server configuration"
 	psk := []byte("udp-pipeline-test-psk")
 	destination := M.ParseSocksaddr("192.0.2.1:443")
 	payload := []byte("first datagram")
 	for _, mode := range []Mode{ModeDefault, ModeUnshaped, ModeUnsafeRaw} {
 		t.Run(mode.String(), func(t *testing.T) {
+			t.Parallel()
+
 			clientSide, serverSide := net.Pipe()
 			defer clientSide.Close()
 			defer serverSide.Close()
