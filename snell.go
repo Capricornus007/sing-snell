@@ -46,7 +46,7 @@ const (
 var (
 	ErrBadVersion            = E.New("snell: bad header version")
 	ErrReservedNonZero       = E.New("snell: reserved header octet is non-zero")
-	ErrPayloadTooLarge       = E.New("snell: payload length exceeds maximum")
+	ErrPayloadTooLarge       = E.Cause1(E.New("snell: payload length exceeds maximum"), errMessageTooLong)
 	ErrUnsupportedCommand    = E.New("snell: unsupported command")
 	ErrUnexpectedReply       = E.New("snell: unexpected reply opcode")
 	ErrEmptyDomainUDPPayload = E.New("snell: empty UDP payload is not allowed for a domain destination")
