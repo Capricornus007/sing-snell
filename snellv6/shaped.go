@@ -305,6 +305,10 @@ type packetVectorisedShapedWriter struct {
 }
 
 func (w *packetVectorisedShapedWriter) WriteVectorised(buffers []*buf.Buffer) error {
+	err := validatePacketVectorBuffers(buffers)
+	if err != nil {
+		return err
+	}
 	var records []*buf.Buffer
 	defer func() {
 		buf.ReleaseMulti(records)
@@ -312,15 +316,9 @@ func (w *packetVectorisedShapedWriter) WriteVectorised(buffers []*buf.Buffer) er
 	recordWriter := w.writer
 	recordWriter.access.Lock()
 	defer recordWriter.access.Unlock()
-	var messageTooLongErr error
 	for _, buffer := range buffers {
 		if buffer.IsEmpty() {
 			buffer.Release()
-			continue
-		}
-		if buffer.Len() > maxPayload {
-			buffer.Release()
-			messageTooLongErr = snell.ErrPayloadTooLarge
 			continue
 		}
 		recordWriter.payloadLimitFor(time.Now())
@@ -328,15 +326,11 @@ func (w *packetVectorisedShapedWriter) WriteVectorised(buffers []*buf.Buffer) er
 		records = append(records, record)
 	}
 	if len(records) == 0 {
-		return messageTooLongErr
+		return nil
 	}
 	flushRecords := records
 	records = nil
-	err := w.upstream.WriteVectorised(flushRecords)
-	if err != nil {
-		return err
-	}
-	return messageTooLongErr
+	return w.upstream.WriteVectorised(flushRecords)
 }
 
 var _ N.VectorisedWriter = (*packetVectorisedShapedWriter)(nil)
